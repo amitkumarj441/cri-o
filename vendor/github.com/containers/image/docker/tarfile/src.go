@@ -3,6 +3,7 @@ package tarfile
 import (
 	"archive/tar"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"io/ioutil"
@@ -20,11 +21,11 @@ import (
 type Source struct {
 	tarPath string
 	// The following data is only available after ensureCachedDataIsPresent() succeeds
-	tarManifest       *manifestItem // nil if not available yet.
+	tarManifest       *ManifestItem // nil if not available yet.
 	configBytes       []byte
 	configDigest      digest.Digest
-	orderedDiffIDList []diffID
-	knownLayers       map[diffID]*layerInfo
+	orderedDiffIDList []digest.Digest
+	knownLayers       map[digest.Digest]*layerInfo
 	// Other state
 	generatedManifest []byte // Private cache for GetManifest(), nil if not set yet.
 }
@@ -145,23 +146,28 @@ func (s *Source) ensureCachedDataIsPresent() error {
 		return err
 	}
 
+	// Check to make sure length is 1
+	if len(tarManifest) != 1 {
+		return errors.Errorf("Unexpected tar manifest.json: expected 1 item, got %d", len(tarManifest))
+	}
+
 	// Read and parse config.
-	configBytes, err := s.readTarComponent(tarManifest.Config)
+	configBytes, err := s.readTarComponent(tarManifest[0].Config)
 	if err != nil {
 		return err
 	}
-	var parsedConfig image // Most fields ommitted, we only care about layer DiffIDs.
+	var parsedConfig manifest.Schema2Image // There's a lot of info there, but we only really care about layer DiffIDs.
 	if err := json.Unmarshal(configBytes, &parsedConfig); err != nil {
-		return errors.Wrapf(err, "Error decoding tar config %s", tarManifest.Config)
+		return errors.Wrapf(err, "Error decoding tar config %s", tarManifest[0].Config)
 	}
 
-	knownLayers, err := s.prepareLayerData(tarManifest, &parsedConfig)
+	knownLayers, err := s.prepareLayerData(&tarManifest[0], &parsedConfig)
 	if err != nil {
 		return err
 	}
 
 	// Success; commit.
-	s.tarManifest = tarManifest
+	s.tarManifest = &tarManifest[0]
 	s.configBytes = configBytes
 	s.configDigest = digest.FromBytes(configBytes)
 	s.orderedDiffIDList = parsedConfig.RootFS.DiffIDs
@@ -170,28 +176,30 @@ func (s *Source) ensureCachedDataIsPresent() error {
 }
 
 // loadTarManifest loads and decodes the manifest.json.
-func (s *Source) loadTarManifest() (*manifestItem, error) {
+func (s *Source) loadTarManifest() ([]ManifestItem, error) {
 	// FIXME? Do we need to deal with the legacy format?
 	bytes, err := s.readTarComponent(manifestFileName)
 	if err != nil {
 		return nil, err
 	}
-	var items []manifestItem
+	var items []ManifestItem
 	if err := json.Unmarshal(bytes, &items); err != nil {
 		return nil, errors.Wrap(err, "Error decoding tar manifest.json")
 	}
-	if len(items) != 1 {
-		return nil, errors.Errorf("Unexpected tar manifest.json: expected 1 item, got %d", len(items))
-	}
-	return &items[0], nil
+	return items, nil
 }
 
-func (s *Source) prepareLayerData(tarManifest *manifestItem, parsedConfig *image) (map[diffID]*layerInfo, error) {
+// LoadTarManifest loads and decodes the manifest.json
+func (s *Source) LoadTarManifest() ([]ManifestItem, error) {
+	return s.loadTarManifest()
+}
+
+func (s *Source) prepareLayerData(tarManifest *ManifestItem, parsedConfig *manifest.Schema2Image) (map[digest.Digest]*layerInfo, error) {
 	// Collect layer data available in manifest and config.
 	if len(tarManifest.Layers) != len(parsedConfig.RootFS.DiffIDs) {
 		return nil, errors.Errorf("Inconsistent layer count: %d in manifest, %d in config", len(tarManifest.Layers), len(parsedConfig.RootFS.DiffIDs))
 	}
-	knownLayers := map[diffID]*layerInfo{}
+	knownLayers := map[digest.Digest]*layerInfo{}
 	unknownLayerSizes := map[string]*layerInfo{} // Points into knownLayers, a "to do list" of items with unknown sizes.
 	for i, diffID := range parsedConfig.RootFS.DiffIDs {
 		if _, ok := knownLayers[diffID]; ok {
@@ -241,28 +249,34 @@ func (s *Source) prepareLayerData(tarManifest *manifestItem, parsedConfig *image
 
 // GetManifest returns the image's manifest along with its MIME type (which may be empty when it can't be determined but the manifest is available).
 // It may use a remote (= slow) service.
-func (s *Source) GetManifest() ([]byte, string, error) {
+// If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve (when the primary manifest is a manifest list);
+// this never happens if the primary manifest is not a manifest list (e.g. if the source never returns manifest lists).
+func (s *Source) GetManifest(instanceDigest *digest.Digest) ([]byte, string, error) {
+	if instanceDigest != nil {
+		// How did we even get here? GetManifest(nil) has returned a manifest.DockerV2Schema2MediaType.
+		return nil, "", errors.Errorf(`Manifest lists are not supported by "docker-daemon:"`)
+	}
 	if s.generatedManifest == nil {
 		if err := s.ensureCachedDataIsPresent(); err != nil {
 			return nil, "", err
 		}
-		m := schema2Manifest{
+		m := manifest.Schema2{
 			SchemaVersion: 2,
 			MediaType:     manifest.DockerV2Schema2MediaType,
-			Config: distributionDescriptor{
+			ConfigDescriptor: manifest.Schema2Descriptor{
 				MediaType: manifest.DockerV2Schema2ConfigMediaType,
 				Size:      int64(len(s.configBytes)),
 				Digest:    s.configDigest,
 			},
-			Layers: []distributionDescriptor{},
+			LayersDescriptors: []manifest.Schema2Descriptor{},
 		}
 		for _, diffID := range s.orderedDiffIDList {
 			li, ok := s.knownLayers[diffID]
 			if !ok {
 				return nil, "", errors.Errorf("Internal inconsistency: Information about layer %s missing", diffID)
 			}
-			m.Layers = append(m.Layers, distributionDescriptor{
-				Digest:    digest.Digest(diffID), // diffID is a digest of the uncompressed tarball
+			m.LayersDescriptors = append(m.LayersDescriptors, manifest.Schema2Descriptor{
+				Digest:    diffID, // diffID is a digest of the uncompressed tarball
 				MediaType: manifest.DockerV2Schema2LayerMediaType,
 				Size:      li.size,
 			})
@@ -274,13 +288,6 @@ func (s *Source) GetManifest() ([]byte, string, error) {
 		s.generatedManifest = manifestBytes
 	}
 	return s.generatedManifest, manifest.DockerV2Schema2MediaType, nil
-}
-
-// GetTargetManifest returns an image's manifest given a digest. This is mainly used to retrieve a single image's manifest
-// out of a manifest list.
-func (s *Source) GetTargetManifest(digest digest.Digest) ([]byte, string, error) {
-	// How did we even get here? GetManifest() above has returned a manifest.DockerV2Schema2MediaType.
-	return nil, "", errors.Errorf(`Manifest lists are not supported by "docker-daemon:"`)
 }
 
 type readCloseWrapper struct {
@@ -305,7 +312,7 @@ func (s *Source) GetBlob(info types.BlobInfo) (io.ReadCloser, int64, error) {
 		return ioutil.NopCloser(bytes.NewReader(s.configBytes)), int64(len(s.configBytes)), nil
 	}
 
-	if li, ok := s.knownLayers[diffID(info.Digest)]; ok { // diffID is a digest of the uncompressed tarball,
+	if li, ok := s.knownLayers[info.Digest]; ok { // diffID is a digest of the uncompressed tarball,
 		stream, err := s.openTarComponent(li.path)
 		if err != nil {
 			return nil, 0, err
@@ -347,6 +354,13 @@ func (s *Source) GetBlob(info types.BlobInfo) (io.ReadCloser, int64, error) {
 }
 
 // GetSignatures returns the image's signatures.  It may use a remote (= slow) service.
-func (s *Source) GetSignatures() ([][]byte, error) {
+// If instanceDigest is not nil, it contains a digest of the specific manifest instance to retrieve signatures for
+// (when the primary manifest is a manifest list); this never happens if the primary manifest is not a manifest list
+// (e.g. if the source never returns manifest lists).
+func (s *Source) GetSignatures(ctx context.Context, instanceDigest *digest.Digest) ([][]byte, error) {
+	if instanceDigest != nil {
+		// How did we even get here? GetManifest(nil) has returned a manifest.DockerV2Schema2MediaType.
+		return nil, errors.Errorf(`Manifest lists are not supported by "docker-daemon:"`)
+	}
 	return [][]byte{}, nil
 }

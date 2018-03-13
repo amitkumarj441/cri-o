@@ -2,139 +2,132 @@
 % Dan Walsh
 % SEPTEMBER 2016
 # NAME
-crio - Enable OCI Kubernetes Container Runtime daemon
+crio - OCI Kubernetes Container Runtime daemon
 
 # SYNOPSIS
-**crio**
-[**--apparmor-profile**=[*value*]]
-[**--cgroup-manager**=[*value*]]
-[**--cni-config-dir**=[*value*]]
-[**--cni-plugin-dir**=[*value*]]
-[**--config**=[*value*]]
-[**--conmon**=[*value*]]
-[**--cpu-profile**=[*value*]]
-[**--debug**]
-[**--default-transport**=[*value*]]
-[**--help**|**-h**]
-[**--listen**=[*value*]]
-[**--log**=[*value*]]
-[**--log-format value**]
-[**--pause-command**=[*value*]]
-[**--pause-image**=[*value*]]
-[**--root**=[*value*]]
-[**--runroot**=[*value*]]
-[**--runtime**=[*value*]]
-[**--seccomp-profile**=[*value*]]
-[**--selinux**]
-[**--signature-policy**=[*value*]]
-[**--storage-driver**=[*value*]]
-[**--storage-opt**=[*value*]]
-[**--version**|**-v**]
-
+crio
+```
+[--apparmor-profile=[value]]
+[--cgroup-manager=[value]]
+[--cni-config-dir=[value]]
+[--cni-plugin-dir=[value]]
+[--config=[value]]
+[--conmon=[value]]
+[--cpu-profile=[value]]
+[--default-transport=[value]]
+[--help|-h]
+[--insecure-registry=[value]]
+[--listen=[value]]
+[--log=[value]]
+[--log-format value]
+[--log-level value]
+[--pause-command=[value]]
+[--pause-image=[value]]
+[--registry=[value]]
+[--root=[value]]
+[--runroot=[value]]
+[--runtime=[value]]
+[--seccomp-profile=[value]]
+[--selinux]
+[--signature-policy=[value]]
+[--storage-driver=[value]]
+[--storage-opt=[value]]
+[--version|-v]
+```
 # DESCRIPTION
 OCI-based implementation of Kubernetes Container Runtime Interface Daemon
 
 crio is meant to provide an integration path between OCI conformant runtimes and the kubelet. Specifically, it implements the Kubelet Container Runtime Interface (CRI) using OCI conformant runtimes. The scope of crio is tied to the scope of the CRI.
 
-	* Support multiple image formats including the existing Docker image format
-	* Support for multiple means to download images including trust & image verification
-	* Container image management (managing image layers, overlay filesystems, etc)
-	* Container process lifecycle management
-	* Monitoring and logging required to satisfy the CRI
-	* Resource isolation as required by the CRI
+1. Support multiple image formats including the existing Docker image format.
+2. Support for multiple means to download images including trust & image verification.
+3. Container image management (managing image layers, overlay filesystems, etc).
+4. Container process lifecycle management.
+5. Monitoring and logging required to satisfy the CRI.
+6. Resource isolation as required by the CRI.
 
-**crio [GLOBAL OPTIONS]**
-
-**crio [GLOBAL OPTIONS] config [OPTIONS]**
-
+**Usage**:
+```
+crio [GLOBAL OPTIONS]
+crio [GLOBAL OPTIONS] config [OPTIONS]
+```
 # GLOBAL OPTIONS
+**--apparmor_profile**="": Name of the apparmor profile to be used as the runtime's default (default: "crio-default")
 
-**--apparmor_profile**=""
-  Name of the apparmor profile to be used as the runtime's default (default: "crio-default")
+**--cgroup-manager**="": cgroup manager (cgroupfs or systemd)
 
-**--cgroup-manager**=""
-  cgroup manager (cgroupfs or systemd)
+**--config**="": path to configuration file
 
-**--config**=""
-  path to configuration file
+**--conmon**="": path to the conmon executable (default: "/usr/local/libexec/crio/conmon")
 
-**--conmon**=""
-  path to the conmon executable (default: "/usr/local/libexec/crio/conmon")
+**--cpu-profile**="": set the CPU profile file path
 
-**--cpu-profile**=""
-set the CPU profile file path
+**--default-transport**: A prefix to prepend to image names that can't be pulled as-is.
 
-**--debug**
-  Enable debug output for logging
+**--help, -h**: Print usage statement
 
-**--default-transport**
-  A prefix to prepend to image names that can't be pulled as-is.
+**--insecure-registry=**: Enable insecure registry communication, i.e., enable un-encrypted and/or untrusted communication.
 
-**--help, -h**
-  Print usage statement
+1. List of insecure registries can contain an element with CIDR notation to specify a whole subnet.
+2. Insecure registries accept HTTP or accept HTTPS with certificates from unknown CAs.
+3. Enabling `--insecure-registry`  is useful when running a local registry. However, because its use creates security vulnerabilities, **it should ONLY be enabled for testing purposes**. For increased security, users should add their CA to their system's list of trusted CAs instead of using `--insecure-registry`.
 
-**--image-volumes**=""
-  Image volume handling ('mkdir' or 'ignore') (default: "mkdir")
+**--image-volumes**="": Image volume handling ('mkdir', 'bind' or 'ignore') (default: "mkdir")
 
-**--listen**=""
-  Path to crio socket (default: "/var/run/crio.sock")
+1. mkdir: A directory is created inside the container root filesystem for the volumes.
+2. bind: A directory is created inside container state directory and bind mounted into the container for the volumes.
+3. ignore: All volumes are just ignored and no action is taken.
 
-**--log**=""
-  Set the log file path where internal debug information is written
+**--listen**="": Path to CRI-O socket (default: "/var/run/crio/crio.sock")
 
-**--log-format**=""
-  Set the format used by logs ('text' (default), or 'json') (default: "text")
+**--log**="": Set the log file path where internal debug information is written
 
-**--pause-command**=""
-  Path to the pause executable in the pause image (default: "/pause")
+**--log-format**="": Set the format used by logs ('text' (default), or 'json') (default: "text")
 
-**--pause-image**=""
-  Image which contains the pause executable (default: "kubernetes/pause")
+**--log-level**="": log crio messages above specified level: debug, info (default), warn, error, fatal or panic
 
-**--root**=""
-  CRIO root dir (default: "/var/lib/containers/storage")
+**--log-size-max**="": Maximum log size in bytes for a container (default: -1 (no limit)). If it is positive, it must be >= 8192 (to match/exceed conmon read buffer).
 
-**--runroot**=""
-  CRIO state dir (default: "/var/run/containers/storage")
+**--pause-command**="": Path to the pause executable in the pause image (default: "/pause")
 
-**--runtime**=""
-  OCI runtime path (default: "/usr/bin/runc")
+**--pause-image**="": Image which contains the pause executable (default: "kubernetes/pause")
 
-**--selinux**=*true*|*false*
-  Enable selinux support (default: false)
+**--pids-limit**="": Maximum number of processes allowed in a container (default: 1024)
 
-**--seccomp-profile**=""
-  Path to the seccomp json profile to be used as the runtime's default (default: "/etc/crio/seccomp.json")
+**--root**="": The crio root dir (default: "/var/lib/containers/storage")
 
-**--signature-policy**=""
-  Path to the signature policy json file (default: "", to use the system-wide default)
+**--registry**="": Registry host which will be prepended to unqualified images, can be specified multiple times
 
-**--storage-driver**
-  OCI storage driver (default: "devicemapper")
+**--runroot**="": The crio state dir (default: "/var/run/containers/storage")
 
-**--storage-opt**
-  OCI storage driver option (no default)
+**--runtime**="": OCI runtime path (default: "/usr/bin/runc")
 
-**--cni-config-dir**=""
-  CNI configuration files directory (default: "/etc/cni/net.d/")
+**--selinux**=**true**|**false**: Enable selinux support (default: false)
 
-**--cni-plugin-dir**=""
-  CNI plugin binaries directory (default: "/opt/cni/bin/")
+**--seccomp-profile**="": Path to the seccomp json profile to be used as the runtime's default (default: "/etc/crio/seccomp.json")
 
-**--cpu-profile**
-  Set the CPU profile file path
+**--signature-policy**="": Path to the signature policy json file (default: "", to use the system-wide default)
 
-**--version, -v**
-  Print the version
+**--storage-driver**: OCI storage driver (default: "devicemapper")
+
+**--storage-opt**: OCI storage driver option (no default)
+
+**--cni-config-dir**="": CNI configuration files directory (default: "/etc/cni/net.d/")
+
+**--cni-plugin-dir**="": CNI plugin binaries directory (default: "/opt/cni/bin/")
+
+**--cpu-profile**: Set the CPU profile file path
+
+**--version, -v**: Print the version
 
 # COMMANDS
-CRIO's default command is to start the daemon. However, it currently offers a
+CRI-O's default command is to start the daemon. However, it currently offers a
 single additional subcommand.
 
 ## config
 
 Outputs a commented version of the configuration file that would've been used
-by CRIO. This allows you to save you current configuration setup and then load
+by CRI-O. This allows you to save you current configuration setup and then load
 it later with **--config**. Global options will modify the output.
 
 **--default**

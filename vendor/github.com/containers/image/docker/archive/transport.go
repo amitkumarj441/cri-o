@@ -125,20 +125,19 @@ func (ref archiveReference) PolicyConfigurationNamespaces() []string {
 	return []string{}
 }
 
-// NewImage returns a types.Image for this reference, possibly specialized for this ImageTransport.
-// The caller must call .Close() on the returned Image.
+// NewImage returns a types.ImageCloser for this reference, possibly specialized for this ImageTransport.
+// The caller must call .Close() on the returned ImageCloser.
 // NOTE: If any kind of signature verification should happen, build an UnparsedImage from the value returned by NewImageSource,
 // verify that UnparsedImage, and convert it into a real Image via image.FromUnparsedImage.
-func (ref archiveReference) NewImage(ctx *types.SystemContext) (types.Image, error) {
+// WARNING: This may not do the right thing for a manifest list, see image.FromSource for details.
+func (ref archiveReference) NewImage(ctx *types.SystemContext) (types.ImageCloser, error) {
 	src := newImageSource(ctx, ref)
-	return ctrImage.FromSource(src)
+	return ctrImage.FromSource(ctx, src)
 }
 
-// NewImageSource returns a types.ImageSource for this reference,
-// asking the backend to use a manifest from requestedManifestMIMETypes if possible.
-// nil requestedManifestMIMETypes means manifest.DefaultRequestedManifestMIMETypes.
+// NewImageSource returns a types.ImageSource for this reference.
 // The caller must call .Close() on the returned ImageSource.
-func (ref archiveReference) NewImageSource(ctx *types.SystemContext, requestedManifestMIMETypes []string) (types.ImageSource, error) {
+func (ref archiveReference) NewImageSource(ctx *types.SystemContext) (types.ImageSource, error) {
 	return newImageSource(ctx, ref), nil
 }
 

@@ -8,31 +8,31 @@ function teardown() {
 
 @test "ctr not found correct error message" {
 	start_crio
-	run crioctl ctr status --id randomid
+	run crictl inspect "container_not_exist"
 	echo "$output"
 	[ "$status" -eq 1 ]
-	[[ "$output" =~ "container with ID starting with randomid not found" ]]
 
 	stop_crio
 }
 
 @test "ctr termination reason Completed" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_config.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_config.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	run sleep 5
+	run crictl inspect --output yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" =~ "Reason: Completed" ]]
+	[[ "$output" =~ "reason: Completed" ]]
 
 	cleanup_ctrs
 	cleanup_pods
@@ -41,23 +41,24 @@ function teardown() {
 
 @test "ctr termination reason Error" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 	errorconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["command"] = ["false"]; json.dump(obj, sys.stdout)')
 	echo "$errorconfig" > "$TESTDIR"/container_config_error.json
-	run crioctl ctr create --config "$TESTDIR"/container_config_error.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDIR"/container_config_error.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	run sleep 5
+	run crictl inspect --output yaml "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" =~ "Reason: Error" ]]
+	[[ "$output" =~ "reason: Error" ]]
 
 	cleanup_ctrs
 	cleanup_pods
@@ -66,24 +67,24 @@ function teardown() {
 
 @test "ctr remove" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr remove --id "$ctr_id"
+	run crictl rm "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -93,65 +94,69 @@ function teardown() {
 
 @test "ctr lifecycle" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl pod list
+	run crictl pods --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	[[ "$output" == "$pod_id" ]]
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr list
+	run crictl ps --quiet --state created
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	[[ "$output" == "$ctr_id" ]]
+	run crictl inspect "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr list
+	run crictl ps --quiet --state running
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr stop --id "$ctr_id"
+	[[ "$output" == "$ctr_id" ]]
+	run crictl stop "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr list
+	run crictl ps --quiet --state stopped
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr remove --id "$ctr_id"
+	[[ "$output" == "$ctr_id" ]]
+	run crictl rm "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr list
+	run crictl ps --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod list
+	run crictl pods --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr list
+	[[ "$output" == "$pod_id" ]]
+	run crictl ps --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	[[ "$output" == "" ]]
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod list
+	run crictl pods --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr list
-	echo "$output"
-	[ "$status" -eq 0 ]
+	[[ "$output" == "" ]]
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio
@@ -159,31 +164,28 @@ function teardown() {
 
 @test "ctr logging" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl pod list
-	echo "$output"
-	[ "$status" -eq 0 ]
 
 	# Create a new container.
 	newconfig=$(mktemp --tmpdir crio-config.XXXXXX.json)
 	cp "$TESTDATA"/container_config_logging.json "$newconfig"
 	sed -i 's|"%shellcommand%"|"echo here is some output \&\& echo and some from stderr >\&2"|' "$newconfig"
-	run crioctl ctr create --config "$newconfig" --pod "$pod_id"
+	run crictl create "$pod_id" "$newconfig" "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr stop --id "$ctr_id"
+	run crictl stop "$ctr_id"
 	echo "$output"
 	# Ignore errors on stop.
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id"
 	[ "$status" -eq 0 ]
-	run crioctl ctr remove --id "$ctr_id"
+	run crictl rm "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -191,13 +193,13 @@ function teardown() {
 	logpath="$DEFAULT_LOG_PATH/$pod_id/$ctr_id.log"
 	[ -f "$logpath" ]
 	echo "$logpath :: $(cat "$logpath")"
-	grep -E "^[^\n]+ stdout here is some output$" "$logpath"
-	grep -E "^[^\n]+ stderr and some from stderr$" "$logpath"
+	grep -E "^[^\n]+ stdout F here is some output$" "$logpath"
+	grep -E "^[^\n]+ stderr F and some from stderr$" "$logpath"
 
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -208,32 +210,29 @@ function teardown() {
 
 @test "ctr logging [tty=true]" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl pod list
-	echo "$output"
-	[ "$status" -eq 0 ]
 
 	# Create a new container.
 	newconfig=$(mktemp --tmpdir crio-config.XXXXXX.json)
 	cp "$TESTDATA"/container_config_logging.json "$newconfig"
 	sed -i 's|"%shellcommand%"|"echo here is some output"|' "$newconfig"
 	sed -i 's|"tty": false,|"tty": true,|' "$newconfig"
-	run crioctl ctr create --config "$newconfig" --pod "$pod_id"
+	run crictl create "$pod_id" "$newconfig" "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr stop --id "$ctr_id"
+	run crictl stop "$ctr_id"
 	echo "$output"
 	# Ignore errors on stop.
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id"
 	[ "$status" -eq 0 ]
-	run crioctl ctr remove --id "$ctr_id"
+	run crictl rm "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -241,12 +240,101 @@ function teardown() {
 	logpath="$DEFAULT_LOG_PATH/$pod_id/$ctr_id.log"
 	[ -f "$logpath" ]
 	echo "$logpath :: $(cat "$logpath")"
-	grep --binary -P "^[^\n]+ stdout here is some output\x0d$" "$logpath"
+	grep --binary -P "^[^\n]+ stdout F here is some output\x0d$" "$logpath"
 
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr log max" {
+	LOG_SIZE_MAX_LIMIT=10000 start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+
+	# Create a new container.
+	newconfig=$(mktemp --tmpdir crio-config.XXXXXX.json)
+	cp "$TESTDATA"/container_config_logging.json "$newconfig"
+	sed -i 's|"%shellcommand%"|"for i in $(seq 250); do echo $i; done"|' "$newconfig"
+	run crictl create "$pod_id" "$newconfig" "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	sleep 6
+	run crictl inspect "$ctr_id"
+	[ "$status" -eq 0 ]
+	run crictl rm "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	# Check that the output is what we expect.
+	logpath="$DEFAULT_LOG_PATH/$pod_id/$ctr_id.log"
+	[ -f "$logpath" ]
+	echo "$logpath :: $(cat "$logpath")"
+	len=$(wc -l "$logpath" | awk '{print $1}')
+	[ $len -lt 250 ]
+
+	run crictl stopp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl rmp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr partial line logging" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+
+	# Create a new container.
+	newconfig=$(mktemp --tmpdir crio-config.XXXXXX.json)
+	cp "$TESTDATA"/container_config_logging.json "$newconfig"
+	sed -i 's|"%shellcommand%"|"echo -n hello"|' "$newconfig"
+	run crictl create "$pod_id" "$newconfig" "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl stop "$ctr_id"
+	echo "$output"
+	# Ignore errors on stop.
+	run crictl inspect "$ctr_id"
+	[ "$status" -eq 0 ]
+	run crictl rm "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	# Check that the output is what we expect.
+	logpath="$DEFAULT_LOG_PATH/$pod_id/$ctr_id.log"
+	[ -f "$logpath" ]
+	echo "$logpath :: $(cat "$logpath")"
+	grep -E "^[^\n]+ stdout P hello$" "$logpath"
+
+	run crictl stopp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -258,22 +346,24 @@ function teardown() {
 # regression test for #127
 @test "ctrs status for a pod" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
+	ctr_id="$output"
 
-	run crioctl ctr list --quiet
+	run crictl ps --quiet --state created
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "${output}" != "" ]]
+	[[ "$output" != "" ]]
+	[[ "$output" == "$ctr_id" ]]
 
 	printf '%s\n' "$output" | while IFS= read -r id
 	do
-		run crioctl ctr status --id "$id"
+		run crictl inspect "$id"
 		echo "$output"
 		[ "$status" -eq 0 ]
 	done
@@ -284,105 +374,101 @@ function teardown() {
 }
 
 @test "ctr list filtering" {
+	# start 3 redis sandbox
+	# pod1 ctr1 create & start
+	# pod2 ctr2 create
+	# pod3 ctr3 create & start & stop
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json --name pod1
+	run crictl runp "$TESTDATA"/sandbox1_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod1_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod1_id"
+	run crictl create "$pod1_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox1_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr1_id="$output"
-	run crioctl ctr start --id "$ctr1_id"
+	run crictl start "$ctr1_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json --name pod2
+	run crictl runp "$TESTDATA"/sandbox2_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod2_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod2_id"
+	run crictl create "$pod2_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox2_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr2_id="$output"
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json --name pod3
+	run crictl runp "$TESTDATA"/sandbox3_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod3_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod3_id"
+	run crictl create "$pod3_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox3_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr3_id="$output"
-	run crioctl ctr start --id "$ctr3_id"
+	run crictl start "$ctr3_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr stop --id "$ctr3_id"
+	run crictl stop "$ctr3_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr list --id "$ctr1_id" --quiet
+
+	run crictl ps --id "$ctr1_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr1_id"  ]]
-	run crioctl ctr list --id "${ctr1_id:0:4}" --quiet
+	[[ "$output" == "$ctr1_id" ]]
+	run crictl ps --id "${ctr1_id:0:4}" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr1_id"  ]]
-	run crioctl ctr list --id "$ctr2_id" --pod "$pod2_id" --quiet
+	[[ "$output" == "$ctr1_id" ]]
+	run crictl ps --id "$ctr2_id" --podsandbox "$pod2_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr2_id"  ]]
-	run crioctl ctr list --id "$ctr2_id" --pod "$pod3_id" --quiet
+	[[ "$output" == "$ctr2_id" ]]
+	run crictl ps --id "$ctr2_id" --podsandbox "$pod3_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "" ]]
-	run crioctl ctr list --state created --quiet
+	run crictl ps --state created --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr2_id"  ]]
-	run crioctl ctr list --state running --quiet
+	[[ "$output" == "$ctr2_id" ]]
+	run crictl ps --state running --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr1_id"  ]]
-	run crioctl ctr list --state stopped --quiet
+	[[ "$output" == "$ctr1_id" ]]
+	run crictl ps --state stopped --quiet
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr3_id"  ]]
-	run crioctl ctr list --pod "$pod1_id" --quiet
+	[[ "$output" == "$ctr3_id" ]]
+	run crictl ps --podsandbox "$pod1_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr1_id"  ]]
-	run crioctl ctr list --pod "$pod2_id" --quiet
+	[[ "$output" == "$ctr1_id" ]]
+	run crictl ps --podsandbox "$pod2_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr2_id"  ]]
-	run crioctl ctr list --pod "$pod3_id" --quiet
+	[[ "$output" == "$ctr2_id" ]]
+	run crictl ps --podsandbox "$pod3_id" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr3_id"  ]]
-	run crioctl pod stop --id "$pod1_id"
+	[[ "$output" == "$ctr3_id" ]]
+	run crictl stopp "$pod1_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod1_id"
+	run crictl rmp "$pod1_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod stop --id "$pod2_id"
+	run crictl stopp "$pod2_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod2_id"
+	run crictl rmp "$pod2_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod stop --id "$pod3_id"
+	run crictl stopp "$pod3_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod3_id"
+	run crictl rmp "$pod3_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -391,49 +477,64 @@ function teardown() {
 }
 
 @test "ctr list label filtering" {
+	# start a pod with 3 containers
+	# ctr1 with labels: group=test container=redis version=v1.0.0
+	# ctr2 with labels: group=test container=redis version=v1.0.0
+	# ctr3 with labels: group=test container=redis version=v1.1.0
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id" --name ctr1 --label "a=b" --label "c=d" --label "e=f"
+
+	ctrconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["metadata"]["name"] = "ctr1";obj["labels"]["group"] = "test";obj["labels"]["name"] = "ctr1";obj["labels"]["version"] = "v1.0.0"; json.dump(obj, sys.stdout)')
+	echo "$ctrconfig" > "$TESTDATA"/labeled_container_redis.json
+	run crictl create "$pod_id" "$TESTDATA"/labeled_container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr1_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id" --name ctr2 --label "a=b" --label "c=d"
+
+	ctrconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["metadata"]["name"] = "ctr2";obj["labels"]["group"] = "test";obj["labels"]["name"] = "ctr2";obj["labels"]["version"] = "v1.0.0"; json.dump(obj, sys.stdout)')
+	echo "$ctrconfig" > "$TESTDATA"/labeled_container_redis.json
+	run crictl create "$pod_id" "$TESTDATA"/labeled_container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr2_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id" --name ctr3 --label "a=b"
+
+	ctrconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["metadata"]["name"] = "ctr3";obj["labels"]["group"] = "test";obj["labels"]["name"] = "ctr3";obj["labels"]["version"] = "v1.1.0"; json.dump(obj, sys.stdout)')
+	echo "$ctrconfig" > "$TESTDATA"/labeled_container_redis.json
+	run crictl create "$pod_id" "$TESTDATA"/labeled_container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr3_id="$output"
-	run crioctl ctr list --label "tier=backend" --label "a=b" --label "c=d" --label "e=f" --quiet
+
+	run crictl ps --label "group=test" --label "name=ctr1" --label "version=v1.0.0" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr1_id"  ]]
-	run crioctl ctr list --label "tier=frontend" --quiet
+	[[ "$output" == "$ctr1_id" ]]
+	run crictl ps --label "group=production" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" == "" ]]
-	run crioctl ctr list --label "a=b" --label "c=d" --quiet
+	run crictl ps --label "group=test" --label "version=v1.0.0" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" != "" ]]
-	[[ "$output" =~ "$ctr1_id"  ]]
-	[[ "$output" =~ "$ctr2_id"  ]]
-	run crioctl ctr list --label "a=b" --quiet
+	[[ "$output" =~ "$ctr1_id" ]]
+	[[ "$output" =~ "$ctr2_id" ]]
+	[[ "$output" != "$ctr3_id" ]]
+	run crictl ps --label "group=test" --quiet --all
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" != "" ]]
 	[[ "$output" =~ "$ctr1_id"  ]]
 	[[ "$output" =~ "$ctr2_id"  ]]
 	[[ "$output" =~ "$ctr3_id"  ]]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -443,23 +544,23 @@ function teardown() {
 
 @test "ctr metadata in list & status" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_config.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_config.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
 
-	run crioctl ctr list --id "$ctr_id"
+	run crictl ps --id "$ctr_id" --output yaml --state created
 	echo "$output"
 	[ "$status" -eq 0 ]
 	# TODO: expected value should not hard coded here
-	[[ "$output" =~ "Name: container1" ]]
-	[[ "$output" =~ "Attempt: 1" ]]
+	[[ "$output" =~ "name: container1" ]]
+	[[ "$output" =~ "attempt: 1" ]]
 
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id" --output table
 	echo "$output"
 	[ "$status" -eq 0 ]
 	# TODO: expected value should not hard coded here
@@ -473,21 +574,21 @@ function teardown() {
 
 @test "ctr execsync conflicting with conmon flags parsing" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" sh -c "echo hello world"
+	run crictl exec --sync "$ctr_id" sh -c "echo hello world"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" =~ "hello world" ]]
+	[[ "$output" == "hello world" ]]
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio
@@ -495,28 +596,29 @@ function teardown() {
 
 @test "ctr execsync" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" echo HELLO
+	run crictl exec --sync "$ctr_id" echo HELLO
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" =~ "HELLO" ]]
-	run crioctl ctr execsync --id "$ctr_id" --timeout 1 sleep 10
+	[[ "$output" == "HELLO" ]]
+	run crictl exec --sync --timeout 1 "$ctr_id" sleep 3
 	echo "$output"
 	[[ "$output" =~ "command timed out" ]]
-	run crioctl pod stop --id "$pod_id"
+	[ "$status" -ne 0 ]
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -526,25 +628,50 @@ function teardown() {
 
 @test "ctr device add" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis_device.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis_device.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" ls /dev/mynull
+	run crictl exec --sync "$ctr_id" ls /dev/mynull
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "/dev/mynull" ]]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr hostname env" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crictl create "$pod_id" "$TESTDATA"/container_config.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl exec --sync "$ctr_id" env
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "HOSTNAME" ]]
+	run crictl stopp "$pod_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -554,18 +681,18 @@ function teardown() {
 
 @test "ctr execsync failure" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" doesnotexist
+	run crictl exec --sync "$ctr_id" doesnotexist
 	echo "$output"
 	[ "$status" -ne 0 ]
 
@@ -576,18 +703,18 @@ function teardown() {
 
 @test "ctr execsync exit code" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" false
+	run crictl exec --sync "$ctr_id" false
 	echo "$output"
 	[ "$status" -eq 0 ]
 	[[ "$output" =~ "Exit code: 1" ]]
@@ -598,39 +725,39 @@ function teardown() {
 
 @test "ctr execsync std{out,err}" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" echo hello0 stdout
+	run crictl exec --sync "$ctr_id" echo hello0 stdout
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"$(printf "Stdout:\nhello0 stdout")"* ]]
+	[[ "$output" =~ "hello0 stdout" ]]
 
 	stderrconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["image"]["image"] = "runcom/stderr-test"; obj["command"] = ["/bin/sleep", "600"]; json.dump(obj, sys.stdout)')
 	echo "$stderrconfig" > "$TESTDIR"/container_config_stderr.json
-	run crioctl ctr create --config "$TESTDIR"/container_config_stderr.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDIR"/container_config_stderr.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr execsync --id "$ctr_id" stderr
+	run crictl exec --sync "$ctr_id" stderr
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" == *"$(printf "Stderr:\nthis goes to stderr")"* ]]
-	run crioctl pod stop --id "$pod_id"
+	[[ "$output" =~ "this goes to stderr" ]]
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -640,21 +767,21 @@ function teardown() {
 
 @test "ctr stop idempotent" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_redis.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr stop --id "$ctr_id"
+	run crictl stop "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr stop --id "$ctr_id"
+	run crictl stop "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -665,13 +792,13 @@ function teardown() {
 
 @test "ctr caps drop" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 	capsconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["linux"]["security_context"]["capabilities"] = {u"add_capabilities": [], u"drop_capabilities": [u"mknod", u"kill", u"sys_chroot", u"setuid", u"setgid"]}; json.dump(obj, sys.stdout)')
 	echo "$capsconfig" > "$TESTDIR"/container_config_caps.json
-	run crioctl ctr create --config "$TESTDIR"/container_config_caps.json --pod "$pod_id"
+	run crictl create "$TESTDIR"/container_config_caps.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -682,16 +809,16 @@ function teardown() {
 
 @test "run ctr with image with Config.Volumes" {
 	start_crio
-	run crioctl image pull gcr.io/k8s-testimages/redis:e2e
+	run crictl pull gcr.io/k8s-testimages/redis:e2e
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 	volumesconfig=$(cat "$TESTDATA"/container_redis.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["image"]["image"] = "gcr.io/k8s-testimages/redis:e2e"; obj["args"] = []; json.dump(obj, sys.stdout)')
 	echo "$volumesconfig" > "$TESTDIR"/container_config_volumes.json
-	run crioctl ctr create --config "$TESTDIR"/container_config_volumes.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDIR"/container_config_volumes.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 
@@ -705,29 +832,36 @@ function teardown() {
 		skip "travis container tests don't support testing OOM"
 	fi
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 	oomconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["image"]["image"] = "mrunalp/oom"; obj["linux"]["resources"]["memory_limit_in_bytes"] = 5120000; obj["command"] = ["/oom"]; json.dump(obj, sys.stdout)')
 	echo "$oomconfig" > "$TESTDIR"/container_config_oom.json
-	run crioctl ctr create --config "$TESTDIR"/container_config_oom.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDIR"/container_config_oom.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	# Wait for container to OOM
-	run sleep 10
-	run crioctl ctr status --id "$ctr_id"
-	echo "$output"
-	[ "$status" -eq 0 ]
+	attempt=0
+	while [ $attempt -le 100 ]; do
+		attempt=$((attempt+1))
+		run crictl inspect --output yaml "$ctr_id"
+		echo "$output"
+		[ "$status" -eq 0 ]
+		if [[ "$output" =~ "OOMKilled" ]]; then
+			break
+		fi
+		sleep 10
+	done
 	[[ "$output" =~ "OOMKilled" ]]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -737,37 +871,34 @@ function teardown() {
 
 @test "ctr /etc/resolv.conf rw/ro mode" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
-	run crioctl ctr create --config "$TESTDATA"/container_config_resolvconf.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_config_resolvconf.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id" --output table
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" =~ "Status: CONTAINER_EXITED" ]]
+	[[ "$output" =~ "State: CONTAINER_EXITED" ]]
 	[[ "$output" =~ "Exit Code: 0" ]]
-	[[ "$output" =~ "Reason: Completed" ]]
 
-	run crioctl ctr create --name roctr --config "$TESTDATA"/container_config_resolvconf_ro.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDATA"/container_config_resolvconf_ro.json "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	ctr_id="$output"
-	run crioctl ctr start --id "$ctr_id"
+	run crictl start "$ctr_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl ctr status --id "$ctr_id"
+	run crictl inspect "$ctr_id" --output table
 	echo "$output"
 	[ "$status" -eq 0 ]
-	[[ "$output" =~ "Status: CONTAINER_EXITED" ]]
-	[[ "$output" =~ "Exit Code: 1" ]]
-	[[ "$output" =~ "Reason: Error" ]]
+	[[ "$output" =~ "State: CONTAINER_EXITED" ]]
 
 	cleanup_ctrs
 	cleanup_pods
@@ -776,19 +907,19 @@ function teardown() {
 
 @test "ctr create with non-existent command" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 	newconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["command"] = ["nonexistent"]; json.dump(obj, sys.stdout)')
 	echo "$newconfig" > "$TESTDIR"/container_nonexistent.json
-	run crioctl ctr create --config "$TESTDIR"/container_nonexistent.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDIR"/container_nonexistent.json "$TESTDATA"/sandbox_config.json
 	[ "$status" -ne 0 ]
 	[[ "$output" =~ "executable file not found" ]]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
 	cleanup_ctrs
@@ -798,21 +929,162 @@ function teardown() {
 
 @test "ctr create with non-existent command [tty]" {
 	start_crio
-	run crioctl pod run --config "$TESTDATA"/sandbox_config.json
+	run crictl runp "$TESTDATA"/sandbox_config.json
 	echo "$output"
 	[ "$status" -eq 0 ]
 	pod_id="$output"
 	newconfig=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["command"] = ["nonexistent"]; obj["tty"] = True; json.dump(obj, sys.stdout)')
 	echo "$newconfig" > "$TESTDIR"/container_nonexistent.json
-	run crioctl ctr create --config "$TESTDIR"/container_nonexistent.json --pod "$pod_id"
+	run crictl create "$pod_id" "$TESTDIR"/container_nonexistent.json "$TESTDATA"/sandbox_config.json
 	[ "$status" -ne 0 ]
 	[[ "$output" =~ "executable file not found" ]]
-	run crioctl pod stop --id "$pod_id"
+	run crictl stopp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
-	run crioctl pod remove --id "$pod_id"
+	run crictl rmp "$pod_id"
 	echo "$output"
 	[ "$status" -eq 0 ]
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr update resources" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/memory/memory.limit_in_bytes"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "209715200" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpu/cpu.shares"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "512" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpu/cpu.cfs_period_us"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "10000" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "20000" ]]
+
+	run crictl update --memory 524288000 --cpu-period 20000 --cpu-quota 10000 --cpu-share 256 "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/memory/memory.limit_in_bytes"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "524288000" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpu/cpu.shares"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "256" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpu/cpu.cfs_period_us"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "20000" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "10000" ]]
+
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr correctly setup working directory" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	notexistcwd=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["working_dir"] = "/thisshouldntexistatall"; json.dump(obj, sys.stdout)')
+	echo "$notexistcwd" > "$TESTDIR"/container_cwd_notexist.json
+	run crictl create "$pod_id" "$TESTDIR"/container_cwd_notexist.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	filecwd=$(cat "$TESTDATA"/container_config.json | python -c 'import json,sys;obj=json.load(sys.stdin);obj["working_dir"] = "/etc/passwd"; obj["metadata"]["name"] = "container2"; json.dump(obj, sys.stdout)')
+	echo "$filecwd" > "$TESTDIR"/container_cwd_file.json
+	run crictl create "$pod_id" "$TESTDIR"/container_cwd_file.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -ne 0 ]
+	ctr_id="$output"
+	[[ "$output" =~ "not a directory" ]]
+
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr execsync conflicting with conmon env" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis_env_custom.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	run crictl exec "$ctr_id" env
+	echo "$output"
+	echo "$status"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "acustompathinpath" ]]
+	run crictl exec --sync "$ctr_id" env
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "acustompathinpath" ]]
+	cleanup_ctrs
+	cleanup_pods
+	stop_crio
+}
+
+@test "ctr resources" {
+	start_crio
+	run crictl runp "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	pod_id="$output"
+	run crictl create "$pod_id" "$TESTDATA"/container_redis.json "$TESTDATA"/sandbox_config.json
+	echo "$output"
+	[ "$status" -eq 0 ]
+	ctr_id="$output"
+	run crictl start "$ctr_id"
+	echo "$output"
+	[ "$status" -eq 0 ]
+
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpuset/cpuset.cpus"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "0" ]]
+	run crictl exec --sync "$ctr_id" sh -c "cat /sys/fs/cgroup/cpuset/cpuset.mems"
+	echo "$output"
+	[ "$status" -eq 0 ]
+	[[ "$output" =~ "0" ]]
+
 	cleanup_ctrs
 	cleanup_pods
 	stop_crio

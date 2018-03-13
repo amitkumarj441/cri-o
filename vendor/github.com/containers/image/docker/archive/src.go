@@ -1,9 +1,9 @@
 package archive
 
 import (
-	"github.com/Sirupsen/logrus"
 	"github.com/containers/image/docker/tarfile"
 	"github.com/containers/image/types"
+	"github.com/sirupsen/logrus"
 )
 
 type archiveImageSource struct {
@@ -33,4 +33,9 @@ func (s *archiveImageSource) Reference() types.ImageReference {
 // Close removes resources associated with an initialized ImageSource, if any.
 func (s *archiveImageSource) Close() error {
 	return nil
+}
+
+// LayerInfosForCopy() returns updated layer info that should be used when reading, in preference to values in the manifest, if specified.
+func (s *archiveImageSource) LayerInfosForCopy() ([]types.BlobInfo, error) {
+	return nil, nil
 }

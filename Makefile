@@ -1,3 +1,5 @@
+include Makefile.inc
+
 GO ?= go
 EPOCH_TEST_COMMIT ?= 1cc5a27
 PROJECT := github.com/kubernetes-incubator/cri-o
@@ -11,10 +13,16 @@ LIBEXECDIR ?= ${PREFIX}/libexec
 MANDIR ?= ${PREFIX}/share/man
 ETCDIR ?= ${DESTDIR}/etc
 ETCDIR_CRIO ?= ${ETCDIR}/crio
-BUILDTAGS := selinux seccomp $(shell hack/btrfs_tag.sh) $(shell hack/libdm_tag.sh)
-BASHINSTALLDIR=${PREFIX}/share/bash-completion/completions
+DATAROOTDIR ?= ${PREFIX}/share/containers
+BUILDTAGS ?= $(shell hack/btrfs_tag.sh) $(shell hack/libdm_installed.sh) $(shell hack/libdm_no_deferred_remove_tag.sh) $(shell hack/btrfs_installed_tag.sh) $(shell hack/ostree_tag.sh) $(shell hack/seccomp_tag.sh) $(shell hack/selinux_tag.sh)
+CRICTL_CONFIG_DIR=${DESTDIR}/etc
 
-GIT_COMMIT := $(shell git rev-parse --short HEAD)
+BASHINSTALLDIR=${PREFIX}/share/bash-completion/completions
+OCIUMOUNTINSTALLDIR=$(PREFIX)/share/oci-umount/oci-umount.d
+
+SELINUXOPT ?= $(shell selinuxenabled 2>/dev/null && echo -Z)
+PACKAGES ?= $(shell go list -tags "${BUILDTAGS}" ./... | grep -v github.com/kubernetes-incubator/cri-o/vendor)
+
 BUILD_INFO := $(shell date +%s)
 
 # If GOPATH not specified, use one in the local directory
@@ -27,8 +35,9 @@ GOPKGBASEDIR := $(shell dirname "$(GOPKGDIR)")
 
 # Update VPATH so make finds .gopathok
 VPATH := $(VPATH):$(GOPATH)
-
-LDFLAGS := -ldflags '-X main.gitCommit=${GIT_COMMIT} -X main.buildInfo=${BUILD_INFO}'
+SHRINKFLAGS := -s -w
+BASE_LDFLAGS := ${SHRINKFLAGS} -X main.gitCommit=${GIT_COMMIT} -X main.buildInfo=${BUILD_INFO}
+LDFLAGS := -ldflags '${BASE_LDFLAGS}'
 
 all: binaries crio.conf docs
 
@@ -38,7 +47,8 @@ help:
 	@echo "Usage: make <target>"
 	@echo
 	@echo " * 'install' - Install binaries to system locations"
-	@echo " * 'binaries' - Build crio, conmon and crioctl"
+	@echo " * 'binaries' - Build crio, conmon and pause"
+	@echo " * 'release-note' - Generate release note"
 	@echo " * 'integration' - Execute integration tests"
 	@echo " * 'clean' - Clean artifacts"
 	@echo " * 'lint' - Execute the source code linter"
@@ -47,7 +57,7 @@ help:
 .gopathok:
 ifeq ("$(wildcard $(GOPKGDIR))","")
 	mkdir -p "$(GOPKGBASEDIR)"
-	ln -s "$(CURDIR)" "$(GOPKGBASEDIR)"
+	ln -s "$(CURDIR)" "$(GOPKGDIR)"
 endif
 	touch "$(GOPATH)/.gopathok"
 
@@ -56,47 +66,47 @@ lint: .gopathok
 	@./.tool/lint
 
 gofmt:
-	@./hack/verify-gofmt.sh
+	find . -name '*.go' ! -path './vendor/*' -exec gofmt -s -w {} \+
+	git diff --exit-code
 
-conmon:
+conmon: conmon/config.h
 	$(MAKE) -C $@
 
 pause:
 	$(MAKE) -C $@
 
-bin2img: .gopathok $(wildcard test/bin2img/*.go)
-	go build -tags "$(BUILDTAGS)" -o test/bin2img/$@ $(PROJECT)/test/bin2img
+test/bin2img/bin2img: .gopathok $(wildcard test/bin2img/*.go)
+	$(GO) build -i $(LDFLAGS) -tags "$(BUILDTAGS) containers_image_ostree_stub" -o $@ $(PROJECT)/test/bin2img
 
-copyimg: .gopathok $(wildcard test/copyimg/*.go)
-	go build -tags "$(BUILDTAGS)" -o test/copyimg/$@ $(PROJECT)/test/copyimg
+test/copyimg/copyimg: .gopathok $(wildcard test/copyimg/*.go)
+	$(GO) build -i $(LDFLAGS) -tags "$(BUILDTAGS) containers_image_ostree_stub" -o $@ $(PROJECT)/test/copyimg
 
-checkseccomp: .gopathok $(wildcard test/checkseccomp/*.go)
-	go build -o test/checkseccomp/$@ $(PROJECT)/test/checkseccomp
+test/checkseccomp/checkseccomp: .gopathok $(wildcard test/checkseccomp/*.go)
+	$(GO) build -i $(LDFLAGS) -tags "$(BUILDTAGS) containers_image_ostree_stub" -o $@ $(PROJECT)/test/checkseccomp
 
 crio: .gopathok $(shell hack/find-godeps.sh $(GOPKGDIR) cmd/crio $(PROJECT))
-	$(GO) build -o $@ \
-		-tags "$(BUILDTAGS)" \
-		$(PROJECT)/cmd/crio
-
-crioctl: .gopathok $(shell hack/find-godeps.sh $(GOPKGDIR) cmd/crioctl $(PROJECT))
-	$(GO) build -o $@ $(PROJECT)/cmd/crioctl
-
-kpod: .gopathok $(shell hack/find-godeps.sh $(GOPKGDIR) cmd/kpod $(PROJECT))
-	$(GO) build $(LDFLAGS) -o $@ $(PROJECT)/cmd/kpod
+	$(GO) build -i $(LDFLAGS) -tags "$(BUILDTAGS) containers_image_ostree_stub" -o bin/$@ $(PROJECT)/cmd/crio
 
 crio.conf: crio
-	./crio --config="" config --default > crio.conf
+	./bin/crio --config="" config --default > crio.conf
+
+release-note:
+	@$(GOPATH)/bin/containerd-release -n $(release)
+
+conmon/config.h: cmd/crio-config/config.go oci/oci.go
+	$(GO) build -i $(LDFLAGS) -o bin/crio-config $(PROJECT)/cmd/crio-config
+	( cd conmon && $(CURDIR)/bin/crio-config )
 
 clean:
 ifneq ($(GOPATH),)
 	rm -f "$(GOPATH)/.gopathok"
 endif
 	rm -rf _output
-	rm -f docs/*.1 docs/*.5 docs/*.8
+	rm -f docs/*.5 docs/*.8
 	rm -fr test/testdata/redis-image
 	find . -name \*~ -delete
 	find . -name \#\* -delete
-	rm -f crioctl crio kpod
+	rm -f bin/crio
 	make -C conmon clean
 	make -C pause clean
 	rm -f test/bin2img/bin2img
@@ -107,21 +117,22 @@ crioimage:
 	docker build -t ${CRIO_IMAGE} .
 
 dbuild: crioimage
-	docker run --name=${CRIO_INSTANCE} --privileged ${CRIO_IMAGE} -v ${PWD}:/go/src/${PROJECT} --rm make binaries
+	docker run --name=${CRIO_INSTANCE} -e BUILDTAGS --privileged -v ${PWD}:/go/src/${PROJECT} --rm ${CRIO_IMAGE} make binaries
 
 integration: crioimage
-	docker run -e TESTFLAGS -e TRAVIS -t --privileged --rm -v ${CURDIR}:/go/src/${PROJECT} ${CRIO_IMAGE} make localintegration
+	docker run -e STORAGE_OPTIONS="--storage-driver=vfs" -e TESTFLAGS -e TRAVIS -t --privileged --rm -v ${CURDIR}:/go/src/${PROJECT} ${CRIO_IMAGE} make localintegration
 
-localintegration: clean binaries
+testunit:
+	$(GO) test -tags "$(BUILDTAGS) containers_image_ostree_stub" -cover $(PACKAGES)
+
+localintegration: clean binaries test-binaries
 	./test/test_runner.sh ${TESTFLAGS}
 
-binaries: crio crioctl kpod conmon pause bin2img copyimg checkseccomp
+binaries: crio conmon pause
+test-binaries: test/bin2img/bin2img test/copyimg/copyimg test/checkseccomp/checkseccomp
 
 MANPAGES_MD := $(wildcard docs/*.md)
 MANPAGES    := $(MANPAGES_MD:%.md=%)
-
-docs/%.1: docs/%.1.md .gopathok
-	(go-md2man -in $< -out $@.tmp && touch $@.tmp && mv $@.tmp $@) || ($(GOPATH)/bin/go-md2man -in $< -out $@.tmp && touch $@.tmp && mv $@.tmp $@)
 
 docs/%.5: docs/%.5.md .gopathok
 	(go-md2man -in $< -out $@.tmp && touch $@.tmp && mv $@.tmp $@) || ($(GOPATH)/bin/go-md2man -in $< -out $@.tmp && touch $@.tmp && mv $@.tmp $@)
@@ -131,39 +142,38 @@ docs/%.8: docs/%.8.md .gopathok
 
 docs: $(MANPAGES)
 
-install: .gopathok
-	install -D -m 755 crio $(BINDIR)/crio
-	install -D -m 755 crioctl $(BINDIR)/crioctl
-	install -D -m 755 kpod $(BINDIR)/kpod
-	install -D -m 755 conmon/conmon $(LIBEXECDIR)/crio/conmon
-	install -D -m 755 pause/pause $(LIBEXECDIR)/crio/pause
-	install -d -m 755 $(MANDIR)/man1
-	install -d -m 755 $(MANDIR)/man5
-	install -d -m 755 $(MANDIR)/man8
-	install -m 644 $(filter %.1,$(MANPAGES)) -t $(MANDIR)/man1
-	install -m 644 $(filter %.5,$(MANPAGES)) -t $(MANDIR)/man5
-	install -m 644 $(filter %.8,$(MANPAGES)) -t $(MANDIR)/man8
+install: .gopathok install.bin install.man
 
-install.config:
-	install -D -m 644 crio.conf $(ETCDIR_CRIO)/crio.conf
-	install -D -m 644 seccomp.json $(ETCDIR_CRIO)/seccomp.json
+install.bin: binaries
+	install ${SELINUXOPT} -D -m 755 bin/crio $(BINDIR)/crio
+	install ${SELINUXOPT} -D -m 755 bin/conmon $(LIBEXECDIR)/crio/conmon
+	install ${SELINUXOPT} -D -m 755 bin/pause $(LIBEXECDIR)/crio/pause
+
+install.man: $(MANPAGES)
+	install ${SELINUXOPT} -d -m 755 $(MANDIR)/man5
+	install ${SELINUXOPT} -d -m 755 $(MANDIR)/man8
+	install ${SELINUXOPT} -m 644 $(filter %.5,$(MANPAGES)) -t $(MANDIR)/man5
+	install ${SELINUXOPT} -m 644 $(filter %.8,$(MANPAGES)) -t $(MANDIR)/man8
+
+install.config: crio.conf
+	install ${SELINUXOPT} -d $(DATAROOTDIR)/oci/hooks.d
+	install ${SELINUXOPT} -D -m 644 crio.conf $(ETCDIR_CRIO)/crio.conf
+	install ${SELINUXOPT} -D -m 644 seccomp.json $(ETCDIR_CRIO)/seccomp.json
+	install ${SELINUXOPT} -D -m 644 crio-umount.conf $(OCIUMOUNTINSTALLDIR)/crio-umount.conf
+	install ${SELINUXOPT} -D -m 644 crictl.yaml $(CRICTL_CONFIG_DIR)
 
 install.completions:
-	install -d -m 755 ${BASHINSTALLDIR}
-	install -m 644 -D completions/bash/kpod ${BASHINSTALLDIR}
+	install ${SELINUXOPT} -d -m 755 ${BASHINSTALLDIR}
 
 install.systemd:
-	install -D -m 644 contrib/systemd/crio.service $(PREFIX)/lib/systemd/system/crio.service
-	install -D -m 644 contrib/systemd/crio-shutdown.service $(PREFIX)/lib/systemd/system/crio-shutdown.service
+	install ${SELINUXOPT} -D -m 644 contrib/systemd/crio.service $(PREFIX)/lib/systemd/system/crio.service
+	ln -sf crio.service $(PREFIX)/lib/systemd/system/cri-o.service
+	install ${SELINUXOPT} -D -m 644 contrib/systemd/crio-shutdown.service $(PREFIX)/lib/systemd/system/crio-shutdown.service
 
 uninstall:
 	rm -f $(BINDIR)/crio
-	rm -f $(BINDIR)/crioctl
 	rm -f $(LIBEXECDIR)/crio/conmon
 	rm -f $(LIBEXECDIR)/crio/pause
-	for i in $(filter %.1,$(MANPAGES)); do \
-		rm -f $(MANDIR)/man8/$$(basename $${i}); \
-	done
 	for i in $(filter %.5,$(MANPAGES)); do \
 		rm -f $(MANDIR)/man5/$$(basename $${i}); \
 	done
@@ -182,7 +192,12 @@ endif
 
 .PHONY: install.tools
 
-install.tools: .install.gitvalidation .install.gometalinter .install.md2man
+install.tools: .install.gitvalidation .install.gometalinter .install.md2man .install.release
+
+.install.release:
+	if [ ! -x "$(GOPATH)/bin/containerd-release" ]; then \
+		go get -u github.com/containerd/containerd/cmd/containerd-release; \
+	fi
 
 .install.gitvalidation: .gopathok
 	if [ ! -x "$(GOPATH)/bin/git-validation" ]; then \
@@ -203,13 +218,18 @@ install.tools: .install.gitvalidation .install.gometalinter .install.md2man
 		go get -u github.com/cpuguy83/go-md2man; \
 	fi
 
+.install.ostree: .gopathok
+	if ! pkg-config ostree-1 2> /dev/null ; then \
+		git clone https://github.com/ostreedev/ostree $(GOPATH)/src/github.com/ostreedev/ostree ; \
+		cd $(GOPATH)/src/github.com/ostreedev/ostree ; \
+		./autogen.sh --prefix=/usr/local; \
+		make all install; \
+	fi
+
 .PHONY: \
-	bin2img \
 	binaries \
-	checkseccomp \
 	clean \
 	conmon \
-	copyimg \
 	default \
 	docs \
 	gofmt \

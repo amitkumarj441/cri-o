@@ -1,15 +1,13 @@
 package server
 
 import (
-	"encoding/json"
-	"fmt"
+	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/docker/distribution/reference"
+	"github.com/containers/image/types"
 	"github.com/kubernetes-incubator/cri-o/oci"
-	rspec "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 const (
@@ -19,70 +17,55 @@ const (
 )
 
 // ContainerStatus returns status of the container.
-func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusRequest) (*pb.ContainerStatusResponse, error) {
+func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusRequest) (resp *pb.ContainerStatusResponse, err error) {
+	const operation = "container_status"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("ContainerStatusRequest %+v", req)
-	c, err := s.getContainerFromRequest(req.ContainerId)
+	c, err := s.GetContainerFromRequest(req.ContainerId)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = s.runtime.UpdateStatus(c); err != nil {
-		return nil, err
-	}
-	s.containerStateToDisk(c)
-
 	containerID := c.ID()
-	resp := &pb.ContainerStatusResponse{
+	resp = &pb.ContainerStatusResponse{
 		Status: &pb.ContainerStatus{
 			Id:          containerID,
 			Metadata:    c.Metadata(),
 			Labels:      c.Labels(),
 			Annotations: c.Annotations(),
+			ImageRef:    c.ImageRef(),
 		},
 	}
+	resp.Status.Image = &pb.ImageSpec{Image: c.Image()}
+	if status, err := s.StorageImageServer().ImageStatus(&types.SystemContext{}, c.ImageRef()); err == nil {
+		resp.Status.Image.Image = status.Name
+	}
 
-	mounts, err := s.getMounts(containerID)
-	if err != nil {
-		return nil, err
+	mounts := []*pb.Mount{}
+	for _, cv := range c.Volumes() {
+		mounts = append(mounts, &pb.Mount{
+			ContainerPath: cv.ContainerPath,
+			HostPath:      cv.HostPath,
+			Readonly:      cv.Readonly,
+		})
 	}
 	resp.Status.Mounts = mounts
 
-	imageName := c.Image().Image
-	status, err := s.storageImageServer.ImageStatus(s.imageContext, imageName)
-	if err != nil {
-		return nil, err
-	}
-
-	imageRef := status.ID
-	//
-	// TODO: https://github.com/kubernetes-incubator/cri-o/issues/531
-	//
-	//for _, n := range status.Names {
-	//r, err := reference.ParseNormalizedNamed(n)
-	//if err != nil {
-	//return nil, fmt.Errorf("failed to normalize image name for ImageRef: %v", err)
-	//}
-	//if digested, isDigested := r.(reference.Canonical); isDigested {
-	//imageRef = reference.FamiliarString(digested)
-	//break
-	//}
-	//}
-	resp.Status.ImageRef = imageRef
-
-	for _, n := range status.Names {
-		r, err := reference.ParseNormalizedNamed(n)
-		if err != nil {
-			return nil, fmt.Errorf("failed to normalize image name for Image: %v", err)
-		}
-		if tagged, isTagged := r.(reference.Tagged); isTagged {
-			imageName = reference.FamiliarString(tagged)
-			break
-		}
-	}
-	resp.Status.Image = &pb.ImageSpec{Image: imageName}
-
-	cState := s.runtime.ContainerStatus(c)
+	cState := s.Runtime().ContainerStatus(c)
 	rStatus := pb.ContainerState_CONTAINER_UNKNOWN
+
+	// If we defaulted to exit code -1 earlier then we attempt to
+	// get the exit code from the exit file again.
+	if cState.ExitCode == -1 {
+		err := s.Runtime().UpdateStatus(c)
+		if err != nil {
+			logrus.Warnf("Failed to UpdateStatus of container %s: %v", c.ID(), err)
+		}
+		cState = s.Runtime().ContainerStatus(c)
+	}
 
 	switch cState.Status {
 	case oci.ContainerStateCreated:
@@ -116,50 +99,8 @@ func (s *Server) ContainerStatus(ctx context.Context, req *pb.ContainerStatusReq
 	}
 
 	resp.Status.State = rStatus
+	resp.Status.LogPath = c.LogPath()
 
 	logrus.Debugf("ContainerStatusResponse: %+v", resp)
 	return resp, nil
-}
-
-func (s *Server) getMounts(id string) ([]*pb.Mount, error) {
-	config, err := s.store.FromContainerDirectory(id, "config.json")
-	if err != nil {
-		return nil, err
-	}
-	var m rspec.Spec
-	if err = json.Unmarshal(config, &m); err != nil {
-		return nil, err
-	}
-	isRO := func(m rspec.Mount) bool {
-		var ro bool
-		for _, o := range m.Options {
-			if o == "ro" {
-				ro = true
-				break
-			}
-		}
-		return ro
-	}
-	isBind := func(m rspec.Mount) bool {
-		var bind bool
-		for _, o := range m.Options {
-			if o == "bind" || o == "rbind" {
-				bind = true
-				break
-			}
-		}
-		return bind
-	}
-	mounts := []*pb.Mount{}
-	for _, b := range m.Mounts {
-		if !isBind(b) {
-			continue
-		}
-		mounts = append(mounts, &pb.Mount{
-			ContainerPath: b.Destination,
-			HostPath:      b.Source,
-			Readonly:      isRO(b),
-		})
-	}
-	return mounts, nil
 }

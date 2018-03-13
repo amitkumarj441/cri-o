@@ -2,21 +2,27 @@ package server
 
 import (
 	"fmt"
+	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/kubernetes-incubator/cri-o/oci"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 // StartContainer starts the container.
-func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*pb.StartContainerResponse, error) {
+func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (resp *pb.StartContainerResponse, err error) {
+	const operation = "start_container"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("StartContainerRequest %+v", req)
-	c, err := s.getContainerFromRequest(req.ContainerId)
+	c, err := s.GetContainerFromRequest(req.ContainerId)
 	if err != nil {
 		return nil, err
 	}
-	state := s.runtime.ContainerStatus(c)
+	state := s.Runtime().ContainerStatus(c)
 	if state.Status != oci.ContainerStateCreated {
 		return nil, fmt.Errorf("container %s is not in created state: %s", c.ID(), state.Status)
 	}
@@ -27,17 +33,17 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 		// adjust container started/finished time and set an error to be
 		// returned in the Reason field for container status call.
 		if err != nil {
-			s.runtime.SetStartFailed(c, err)
+			s.Runtime().SetStartFailed(c, err)
 		}
-		s.containerStateToDisk(c)
+		s.ContainerStateToDisk(c)
 	}()
 
-	err = s.runtime.StartContainer(c)
+	err = s.Runtime().StartContainer(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start container %s: %v", c.ID(), err)
 	}
 
-	resp := &pb.StartContainerResponse{}
+	resp = &pb.StartContainerResponse{}
 	logrus.Debugf("StartContainerResponse %+v", resp)
 	return resp, nil
 }

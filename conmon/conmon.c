@@ -7,11 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
@@ -20,33 +20,61 @@
 #include <termios.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <inttypes.h>
 
 #include <glib.h>
 #include <glib-unix.h>
 
 #include "cmsg.h"
+#include "config.h"
 
-#define pexit(fmt, ...)                                                          \
-	do {                                                                     \
-		fprintf(stderr, "[conmon:e]: " fmt " %m\n", ##__VA_ARGS__);      \
-		syslog(LOG_ERR, "conmon <error>: " fmt ": %m\n", ##__VA_ARGS__); \
-		exit(EXIT_FAILURE);                                              \
+#define pexit(s)                                                                \
+	do {                                                                    \
+		fprintf(stderr, "[conmon:e]: %s %s\n", s, strerror(errno));     \
+		syslog(LOG_ERR, "conmon <error>: %s %s\n", s, strerror(errno)); \
+		exit(EXIT_FAILURE);                                             \
 	} while (0)
 
-#define nexit(fmt, ...)                                                       \
+#define pexitf(fmt, ...)                                                                          \
+	do {                                                                                      \
+		fprintf(stderr, "[conmon:e]: " fmt " %s\n", ##__VA_ARGS__, strerror(errno));      \
+		syslog(LOG_ERR, "conmon <error>: " fmt ": %s\n", ##__VA_ARGS__, strerror(errno)); \
+		exit(EXIT_FAILURE);                                                               \
+	} while (0)
+
+#define nexit(s)                                            \
+	do {                                                \
+		fprintf(stderr, "[conmon:e] %s\n", s);      \
+		syslog(LOG_ERR, "conmon <error>: %s\n", s); \
+		exit(EXIT_FAILURE);                         \
+	} while (0)
+
+#define nexitf(fmt, ...)                                                      \
 	do {                                                                  \
 		fprintf(stderr, "[conmon:e]: " fmt "\n", ##__VA_ARGS__);      \
 		syslog(LOG_ERR, "conmon <error>: " fmt " \n", ##__VA_ARGS__); \
 		exit(EXIT_FAILURE);                                           \
 	} while (0)
 
-#define nwarn(fmt, ...)                                                        \
+#define nwarn(s)                                             \
+	do {                                                 \
+		fprintf(stderr, "[conmon:w]: %s\n", s);      \
+		syslog(LOG_INFO, "conmon <nwarn>: %s\n", s); \
+	} while (0)
+
+#define nwarnf(fmt, ...)                                                       \
 	do {                                                                   \
 		fprintf(stderr, "[conmon:w]: " fmt "\n", ##__VA_ARGS__);       \
 		syslog(LOG_INFO, "conmon <nwarn>: " fmt " \n", ##__VA_ARGS__); \
 	} while (0)
 
-#define ninfo(fmt, ...)                                                        \
+#define ninfo(s)                                             \
+	do {                                                 \
+		fprintf(stderr, "[conmon:i]: %s\n", s);      \
+		syslog(LOG_INFO, "conmon <ninfo>: %s\n", s); \
+	} while (0)
+
+#define ninfof(fmt, ...)                                                       \
 	do {                                                                   \
 		fprintf(stderr, "[conmon:i]: " fmt "\n", ##__VA_ARGS__);       \
 		syslog(LOG_INFO, "conmon <ninfo>: " fmt " \n", ##__VA_ARGS__); \
@@ -90,36 +118,59 @@ static inline void strv_cleanup(char ***strv)
 #define _cleanup_gstring_ _cleanup_(gstring_free_cleanup)
 #define _cleanup_strv_ _cleanup_(strv_cleanup)
 
-#define BUF_SIZE 8192
 #define CMD_SIZE 1024
 #define MAX_EVENTS 10
 
+static volatile pid_t container_pid = -1;
+static volatile pid_t create_pid = -1;
+static bool opt_version = false;
 static bool opt_terminal = false;
 static bool opt_stdin = false;
+static bool opt_leave_stdin_open = false;
 static char *opt_cid = NULL;
 static char *opt_cuuid = NULL;
 static char *opt_runtime_path = NULL;
 static char *opt_bundle_path = NULL;
 static char *opt_pid_file = NULL;
 static bool opt_systemd_cgroup = false;
+static bool opt_no_pivot = false;
 static char *opt_exec_process_spec = NULL;
 static bool opt_exec = false;
+static char *opt_restore_path = NULL;
 static char *opt_log_path = NULL;
+static char *opt_exit_dir = NULL;
 static int opt_timeout = 0;
+static int64_t opt_log_size_max = -1;
+static char *opt_socket_path = DEFAULT_SOCKET_PATH;
+static bool opt_no_new_keyring = false;
+static char *opt_exit_command = NULL;
+static gchar **opt_exit_args = NULL;
+static bool opt_replace_listen_pid = false;
 static GOptionEntry opt_entries[] =
 {
   { "terminal", 't', 0, G_OPTION_ARG_NONE, &opt_terminal, "Terminal", NULL },
   { "stdin", 'i', 0, G_OPTION_ARG_NONE, &opt_stdin, "Stdin", NULL },
+  { "leave-stdin-open", 0, 0, G_OPTION_ARG_NONE, &opt_leave_stdin_open, "Leave stdin open when attached client disconnects", NULL },
   { "cid", 'c', 0, G_OPTION_ARG_STRING, &opt_cid, "Container ID", NULL },
   { "cuuid", 'u', 0, G_OPTION_ARG_STRING, &opt_cuuid, "Container UUID", NULL },
   { "runtime", 'r', 0, G_OPTION_ARG_STRING, &opt_runtime_path, "Runtime path", NULL },
+  { "restore", 0, 0, G_OPTION_ARG_STRING, &opt_restore_path, "Restore a container from a checkpoint", NULL },
+  { "no-new-keyring", 0, 0, G_OPTION_ARG_NONE, &opt_no_new_keyring, "Do not create a new session keyring for the container", NULL },
+  { "no-pivot", 0, 0, G_OPTION_ARG_NONE, &opt_no_pivot, "Do not use pivot_root", NULL },
+  { "replace-listen-pid", 0, 0, G_OPTION_ARG_NONE, &opt_replace_listen_pid, "Replace listen pid if set for oci-runtime pid", NULL },
   { "bundle", 'b', 0, G_OPTION_ARG_STRING, &opt_bundle_path, "Bundle path", NULL },
   { "pidfile", 'p', 0, G_OPTION_ARG_STRING, &opt_pid_file, "PID file", NULL },
   { "systemd-cgroup", 's', 0, G_OPTION_ARG_NONE, &opt_systemd_cgroup, "Enable systemd cgroup manager", NULL },
   { "exec", 'e', 0, G_OPTION_ARG_NONE, &opt_exec, "Exec a command in a running container", NULL },
   { "exec-process-spec", 0, 0, G_OPTION_ARG_STRING, &opt_exec_process_spec, "Path to the process spec for exec", NULL },
+  { "exit-dir", 0, 0, G_OPTION_ARG_STRING, &opt_exit_dir, "Path to the directory where exit files are written", NULL },
+  { "exit-command", 0, 0, G_OPTION_ARG_STRING, &opt_exit_command, "Path to the program to execute when the container terminates its execution", NULL },
+  { "exit-command-arg", 0, 0, G_OPTION_ARG_STRING_ARRAY, &opt_exit_args, "Additional arg to pass to the exit command.  Can be specified multiple times", NULL },
   { "log-path", 'l', 0, G_OPTION_ARG_STRING, &opt_log_path, "Log file path", NULL },
   { "timeout", 'T', 0, G_OPTION_ARG_INT, &opt_timeout, "Timeout in seconds", NULL },
+  { "log-size-max", 0, 0, G_OPTION_ARG_INT64, &opt_log_size_max, "Maximum size of log file", NULL },
+  { "socket-dir-path", 0, 0, G_OPTION_ARG_STRING, &opt_socket_path, "Location of container attach sockets", NULL },
+  { "version", 0, 0, G_OPTION_ARG_NONE, &opt_version, "Print the version and exit", NULL },
   { NULL }
 };
 
@@ -127,6 +178,8 @@ static GOptionEntry opt_entries[] =
 #define TSBUFLEN 44
 
 #define CGROUP_ROOT "/sys/fs/cgroup"
+
+static int log_fd = -1;
 
 static ssize_t write_all(int fd, const void *buf, size_t count)
 {
@@ -197,9 +250,6 @@ ssize_t writev_buffer_append_segment(int fd, writev_buffer_t *buf, const void *d
 {
 	if (data == NULL)
 		return 1;
-
-	if (len < 0)
-		len = strlen ((char *)data);
 
 	if (buf->iovcnt == WRITEV_BUFFER_N_IOV &&
 	    writev_buffer_flush (fd, buf) < 0)
@@ -274,16 +324,38 @@ const char *stdpipe_name(stdpipe_t pipe)
 }
 
 /*
+* reopen_log_file reopens the log file fd.
+*/
+static void reopen_log_file(void)
+{
+	_cleanup_free_ char *opt_log_path_tmp = g_strdup_printf("%s.tmp", opt_log_path);
+
+	/* Close the current log_fd */
+	close(log_fd);
+
+	/* Open the log path file again */
+	log_fd = open(opt_log_path_tmp, O_WRONLY | O_TRUNC | O_CREAT | O_CLOEXEC, 0600);
+	if (log_fd < 0)
+		pexitf("Failed to open log file %s", opt_log_path);
+
+	/* Replace the previous file */
+	if (rename(opt_log_path_tmp, opt_log_path) < 0) {
+		pexit("Failed to rename log file");
+	}
+}
+
+/*
  * The CRI requires us to write logs with a (timestamp, stream, line) format
  * for every newline-separated line. write_k8s_log writes said format for every
  * line in buf, and will partially write the final line of the log if buf is
  * not terminated by a newline.
  */
-int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
+static int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 {
 	char tsbuf[TSBUFLEN];
-	static stdpipe_t trailing_line = NO_PIPE;
 	writev_buffer_t bufv = {0};
+	static int64_t bytes_written = 0;
+	int64_t bytes_to_be_written = 0;
 
 	/*
 	 * Use the same timestamp for every line of the log in this buffer.
@@ -297,30 +369,53 @@ int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 	while (buflen > 0) {
 		const char *line_end = NULL;
 		ptrdiff_t line_len = 0;
+		bool partial = FALSE;
 
 		/* Find the end of the line, or alternatively the end of the buffer. */
 		line_end = memchr(buf, '\n', buflen);
-		if (line_end == NULL)
+		if (line_end == NULL) {
 			line_end = &buf[buflen-1];
+			partial = TRUE;
+		}
 		line_len = line_end - buf + 1;
 
+		/* This is line_len bytes + TSBUFLEN - 1 + 2 (- 1 is for ignoring \0). */
+		bytes_to_be_written = line_len + TSBUFLEN + 1;
+
+		/* If partial, then we add a \n */
+		if (partial) {
+			bytes_to_be_written += 1;
+		}
+
 		/*
-		 * Write the (timestamp, stream) tuple if there isn't any trailing
-		 * output from the previous line (or if there is trailing output but
-		 * the current buffer being printed is from a different pipe).
+		 * We re-open the log file if writing out the bytes will exceed the max
+		 * log size. We also reset the state so that the new file is started with
+		 * a timestamp.
 		 */
-		if (trailing_line != pipe) {
-			/*
-			 * If there was a trailing line from a different pipe, prepend a
-			 * newline to split it properly. This technically breaks the flow
-			 * of the previous line (adding a newline in the log where there
-			 * wasn't one output) but without modifying the file in a
-			 * non-append-only way there's not much we can do.
-			 */
-			if ((trailing_line != NO_PIPE &&
-			     writev_buffer_append_segment(fd, &bufv, "\n", -1) < 0) ||
-			    writev_buffer_append_segment(fd, &bufv, tsbuf, -1) < 0) {
-				nwarn("failed to write (timestamp, stream) to log");
+		if ((opt_log_size_max > 0) && (bytes_written + bytes_to_be_written) > opt_log_size_max) {
+			bytes_written = 0;
+
+			reopen_log_file();
+
+			/* Reassign to the new log file fd */
+			fd = log_fd;
+		}
+
+		/* Output the timestamp */
+		if (writev_buffer_append_segment(fd, &bufv, tsbuf, TSBUFLEN - 1) < 0) {
+			nwarn("failed to write (timestamp, stream) to log");
+			goto next;
+		}
+
+		/* Output log tag for partial or newline */
+		if (partial) {
+			if (writev_buffer_append_segment(fd, &bufv, "P ", 2) < 0) {
+				nwarn("failed to write partial log tag");
+				goto next;
+			}
+		} else {
+			if (writev_buffer_append_segment(fd, &bufv, "F ", 2) < 0) {
+				nwarn("failed to write end log tag");
 				goto next;
 			}
 		}
@@ -331,9 +426,15 @@ int write_k8s_log(int fd, stdpipe_t pipe, const char *buf, ssize_t buflen)
 			goto next;
 		}
 
-		/* If we did not output a full line, then we are a trailing_line. */
-		trailing_line = (*line_end == '\n') ? NO_PIPE : pipe;
+		/* Output a newline for partial */
+		if (partial) {
+			if (writev_buffer_append_segment(fd, &bufv, "\n", 1) < 0) {
+				nwarn("failed to write newline to log");
+				goto next;
+			}
+		}
 
+		bytes_written += bytes_to_be_written;
 next:
 		/* Update the head of the buffer remaining to output. */
 		buf += line_len;
@@ -356,7 +457,7 @@ static char *process_cgroup_subsystem_path(int pid, const char *subsystem) {
 	_cleanup_fclose_ FILE *fp = NULL;
 	fp = fopen(cgroups_file_path, "re");
 	if (fp == NULL) {
-		nwarn("Failed to open cgroups file: %s", cgroups_file_path);
+		nwarnf("Failed to open cgroups file: %s", cgroups_file_path);
 		return NULL;
 	}
 
@@ -370,13 +471,13 @@ static char *process_cgroup_subsystem_path(int pid, const char *subsystem) {
 		_cleanup_strv_ char **subsystems = NULL;
 		ptr = strchr(line, ':');
 		if (ptr == NULL) {
-			nwarn("Error parsing cgroup, ':' not found: %s", line);
+			nwarnf("Error parsing cgroup, ':' not found: %s", line);
 			return NULL;
 		}
 		ptr++;
 		path = strchr(ptr, ':');
 		if (path == NULL) {
-			nwarn("Error parsing cgroup, second ':' not found: %s", line);
+			nwarnf("Error parsing cgroup, second ':' not found: %s", line);
 			return NULL;
 		}
 		*path = 0;
@@ -440,9 +541,9 @@ static int get_pipe_fd_from_env(const char *envname)
 	errno = 0;
 	pipe_fd = strtol(pipe_str, &endptr, 10);
 	if (errno != 0 || *endptr != '\0')
-		pexit("unable to parse %s", envname);
+		pexitf("unable to parse %s", envname);
 	if (fcntl(pipe_fd, F_SETFD, FD_CLOEXEC) == -1)
-		pexit("unable to make %s CLOEXEC", envname);
+		pexitf("unable to make %s CLOEXEC", envname);
 
 	return pipe_fd;
 }
@@ -479,7 +580,6 @@ static int conn_sock = -1;
 static int conn_sock_readable;
 static int conn_sock_writable;
 
-static int log_fd = -1;
 static int oom_event_fd = -1;
 static int attach_socket_fd = -1;
 static int console_socket_fd = -1;
@@ -517,7 +617,6 @@ static gboolean tty_hup_timeout_cb (G_GNUC_UNUSED gpointer user_data)
 
 static bool read_stdio(int fd, stdpipe_t pipe, bool *eof)
 {
-	#define STDIO_BUF_SIZE 8192 /* Sync with redirectResponseToOutputStreams() */
 	/* We use one extra byte at the start, which we don't read into, instead
 	   we use that for marking the pipe when we write to the attached socket */
 	char real_buf[STDIO_BUF_SIZE + 1];
@@ -533,7 +632,7 @@ static bool read_stdio(int fd, stdpipe_t pipe, bool *eof)
 			*eof = true;
 		return false;
 	} else if (num_read < 0) {
-		nwarn("stdio_input read failed %s", strerror(errno));
+		nwarnf("stdio_input read failed %s", strerror(errno));
 		return false;
 	} else {
 		if (write_k8s_log(log_fd, pipe, buf, num_read) < 0) {
@@ -548,6 +647,63 @@ static bool read_stdio(int fd, stdpipe_t pipe, bool *eof)
 		}
 		return true;
 	}
+}
+
+static void on_sigchld(G_GNUC_UNUSED int signal)
+{
+	raise(SIGUSR1);
+}
+
+static void on_sig_exit(int signal)
+{
+	if (container_pid > 0) {
+		if (kill(container_pid, signal) == 0)
+			return;
+	} else if (create_pid > 0) {
+		if (kill(create_pid, signal) == 0)
+			return;
+		if (errno == ESRCH) {
+			/* The create_pid process might have exited, so try container_pid again.  */
+			if (container_pid > 0 && kill(container_pid, signal) == 0)
+				return;
+		}
+	}
+	/* Just force a check if we get here.  */
+	raise(SIGUSR1);
+}
+
+static void check_child_processes(GHashTable *pid_to_handler)
+{
+	void (*cb) (GPid, int, gpointer);
+
+        for (;;) {
+		int status;
+		pid_t pid = waitpid(-1, &status, WNOHANG);
+
+		if (pid < 0 && errno == EINTR)
+			continue;
+		if (pid < 0 && errno == ECHILD) {
+			g_main_loop_quit (main_loop);
+			return;
+		}
+		if (pid < 0)
+			pexit("Failed to read child process status");
+
+		if (pid == 0)
+			return;
+
+		/* If we got here, pid > 0, so we have a valid pid to check.  */
+		cb = g_hash_table_lookup(pid_to_handler, &pid);
+		if (cb)
+			cb(pid, status, 0);
+	}
+}
+
+static gboolean on_sigusr1_cb(gpointer user_data)
+{
+	GHashTable *pid_to_handler = (GHashTable *) user_data;
+	check_child_processes (pid_to_handler);
+        return G_SOURCE_CONTINUE;
 }
 
 static gboolean stdio_cb(int fd, GIOCondition condition, gpointer user_data)
@@ -662,8 +818,12 @@ static gboolean conn_sock_cb(int fd, GIOCondition condition, G_GNUC_UNUSED gpoin
 	/* End of input */
 	conn_sock_shutdown(SHUT_RD);
 	if (masterfd_stdin >= 0 && opt_stdin) {
-		close(masterfd_stdin);
-		masterfd_stdin = -1;
+		if (!opt_leave_stdin_open) {
+			close(masterfd_stdin);
+			masterfd_stdin = -1;
+		} else {
+			ninfo("Not closing input");
+		}
 	}
 	return G_SOURCE_REMOVE;
 }
@@ -678,10 +838,25 @@ static gboolean attach_cb(int fd, G_GNUC_UNUSED GIOCondition condition, G_GNUC_U
 		conn_sock_readable = true;
 		conn_sock_writable = true;
 		g_unix_fd_add (conn_sock, G_IO_IN|G_IO_HUP|G_IO_ERR, conn_sock_cb, GINT_TO_POINTER(STDOUT_PIPE));
-		ninfo("Accepted connection %d", conn_sock);
+		ninfof("Accepted connection %d", conn_sock);
 	}
 
 	return G_SOURCE_CONTINUE;
+}
+
+/*
+ * resize_winsz resizes the pty window size.
+ */
+static void resize_winsz(int height, int width) {
+	struct winsize ws;
+	int ret;
+
+	ws.ws_row = height;
+	ws.ws_col = width;
+	ret = ioctl(masterfd_stdout, TIOCSWINSZ, &ws);
+	if (ret == -1) {
+		nwarn("Failed to set process pty terminal size");
+	}
 }
 
 static gboolean ctrl_cb(int fd, G_GNUC_UNUSED GIOCondition condition, G_GNUC_UNUSED gpointer user_data)
@@ -694,7 +869,6 @@ static gboolean ctrl_cb(int fd, G_GNUC_UNUSED GIOCondition condition, G_GNUC_UNU
 	int ctl_msg_type = -1;
 	int height = -1;
 	int width = -1;
-	struct winsize ws;
 	int ret;
 
 	num_read = read(fd, readptr, readsz);
@@ -704,7 +878,7 @@ static gboolean ctrl_cb(int fd, G_GNUC_UNUSED GIOCondition condition, G_GNUC_UNU
 	}
 
 	readptr[num_read] = '\0';
-	ninfo("Got ctl message: %s\n", ctlbuf);
+	ninfof("Got ctl message: %s", ctlbuf);
 
 	char *beg = ctlbuf;
 	char *newline = strchrnul(beg, '\n');
@@ -715,14 +889,18 @@ static gboolean ctrl_cb(int fd, G_GNUC_UNUSED GIOCondition condition, G_GNUC_UNU
 			nwarn("Failed to sscanf message");
 			return G_SOURCE_CONTINUE;
 		}
-		ninfo("Message type: %d, Height: %d, Width: %d", ctl_msg_type, height, width);
-		ret = ioctl(masterfd_stdout, TIOCGWINSZ, &ws);
-		ninfo("Existing size: %d %d", ws.ws_row, ws.ws_col);
-		ws.ws_row = height;
-		ws.ws_col = width;
-		ret = ioctl(masterfd_stdout, TIOCSWINSZ, &ws);
-		if (ret == -1) {
-			nwarn("Failed to set process pty terminal size");
+		ninfof("Message type: %d, Height: %d, Width: %d", ctl_msg_type, height, width);
+		switch (ctl_msg_type) {
+			// This matches what we write from container_attach.go
+			case 1:
+				resize_winsz(height, width);
+				break;
+			case 2:
+				reopen_log_file();
+				break;
+			default:
+				ninfof("Unknown message type: %d", ctl_msg_type);
+				break;
 		}
 		beg = newline + 1;
 		newline = strchrnul(beg, '\n');
@@ -733,7 +911,7 @@ static gboolean ctrl_cb(int fd, G_GNUC_UNUSED GIOCondition condition, G_GNUC_UNU
 		 * This shouldn't happen as our buffer is larger than
 		 * the message that we expect to receive.
 		 */
-		nwarn("Could not find newline in entire buffer\n");
+		nwarn("Could not find newline in entire buffer");
 	} else if (*beg == '\0') {
 		/* We exhausted all messages that were complete */
 		readptr = ctlbuf;
@@ -761,7 +939,7 @@ static gboolean terminal_accept_cb(int fd, G_GNUC_UNUSED GIOCondition condition,
 	int connfd = -1;
 	struct termios tset;
 
-	ninfo("about to accept from console_socket_fd: %d", fd);
+	ninfof("about to accept from console_socket_fd: %d", fd);
 	connfd = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
 	if (connfd < 0) {
 		nwarn("Failed to accept console-socket connection");
@@ -773,10 +951,10 @@ static gboolean terminal_accept_cb(int fd, G_GNUC_UNUSED GIOCondition condition,
 	unlink(csname);
 
 	/* We exit if this fails. */
-	ninfo("about to recvfd from connfd: %d", connfd);
+	ninfof("about to recvfd from connfd: %d", connfd);
 	console = recvfd(connfd);
 
-	ninfo("console = {.name = '%s'; .fd = %d}", console.name, console.fd);
+	ninfof("console = {.name = '%s'; .fd = %d}", console.name, console.fd);
 	free(console.name);
 
 	/* We change the terminal settings to match kube settings */
@@ -803,14 +981,16 @@ static void
 runtime_exit_cb (G_GNUC_UNUSED GPid pid, int status, G_GNUC_UNUSED gpointer user_data)
 {
 	runtime_status = status;
+	create_pid = -1;
 	g_main_loop_quit (main_loop);
 }
 
 static void
 container_exit_cb (G_GNUC_UNUSED GPid pid, int status, G_GNUC_UNUSED gpointer user_data)
 {
-	ninfo("container %d exited with status %d\n", pid, status);
+	ninfof("container %d exited with status %d", pid, status);
 	container_status = status;
+	container_pid = -1;
 	g_main_loop_quit (main_loop);
 }
 
@@ -845,7 +1025,8 @@ static void write_sync_fd(int sync_pipe_fd, int res, const char *message)
 static char *setup_console_socket(void)
 {
 	struct sockaddr_un addr = {0};
-	char csname[PATH_MAX] = "/tmp/conmon-term.XXXXXXXX";
+	_cleanup_free_ const char *tmpdir = g_get_tmp_dir();
+	_cleanup_free_ char *csname = g_build_filename(tmpdir, "conmon-term.XXXXXX", NULL);
 	/*
 	 * Generate a temporary name. Is this unsafe? Probably, but we can
 	 * replace it with a rename(2) setup if necessary.
@@ -859,7 +1040,7 @@ static char *setup_console_socket(void)
 	addr.sun_family = AF_UNIX;
 	strncpy(addr.sun_path, csname, sizeof(addr.sun_path)-1);
 
-	ninfo("addr{sun_family=AF_UNIX, sun_path=%s}", addr.sun_path);
+	ninfof("addr{sun_family=AF_UNIX, sun_path=%s}", addr.sun_path);
 
 	/* Bind to the console socket path. */
 	console_socket_fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
@@ -869,7 +1050,7 @@ static char *setup_console_socket(void)
 		pexit("Failed to change console-socket permissions");
 	/* XXX: This should be handled with a rename(2). */
 	if (unlink(csname) < 0)
-		pexit("Failed to unlink temporary ranom path");
+		pexit("Failed to unlink temporary random path");
 	if (bind(console_socket_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0)
 		pexit("Failed to bind to console-socket");
 	if (listen(console_socket_fd, 128) < 0)
@@ -889,18 +1070,18 @@ static char *setup_attach_socket(void)
 	 * Create a symlink so we don't exceed unix domain socket
 	 * path length limit.
 	 */
-	attach_symlink_dir_path = g_build_filename("/var/run/crio", opt_cuuid, NULL);
+	attach_symlink_dir_path = g_build_filename(opt_socket_path, opt_cuuid, NULL);
 	if (unlink(attach_symlink_dir_path) == -1 && errno != ENOENT)
 		pexit("Failed to remove existing symlink for attach socket directory");
 
 	if (symlink(opt_bundle_path, attach_symlink_dir_path) == -1)
 		pexit("Failed to create symlink for attach socket");
 
-	attach_sock_path = g_build_filename("/var/run/crio", opt_cuuid, "attach", NULL);
-	ninfo("attach sock path: %s", attach_sock_path);
+	attach_sock_path = g_build_filename(opt_socket_path, opt_cuuid, "attach", NULL);
+	ninfof("attach sock path: %s", attach_sock_path);
 
 	strncpy(attach_addr.sun_path, attach_sock_path, sizeof(attach_addr.sun_path) - 1);
-	ninfo("addr{sun_family=AF_UNIX, sun_path=%s}", attach_addr.sun_path);
+	ninfof("addr{sun_family=AF_UNIX, sun_path=%s}", attach_addr.sun_path);
 
 	/*
 	 * We make the socket non-blocking to avoid a race where client aborts connection
@@ -915,10 +1096,10 @@ static char *setup_attach_socket(void)
 		pexit("Failed to change attach socket permissions");
 
 	if (bind(attach_socket_fd, (struct sockaddr *)&attach_addr, sizeof(struct sockaddr_un)) == -1)
-		pexit("Failed to bind attach socket: %s", attach_sock_path);
+		pexitf("Failed to bind attach socket: %s", attach_sock_path);
 
 	if (listen(attach_socket_fd, 10) == -1)
-		pexit("Failed to listen on attach socket: %s", attach_sock_path);
+		pexitf("Failed to listen on attach socket: %s", attach_sock_path);
 
 	g_unix_fd_add (attach_socket_fd, G_IO_IN, attach_cb, NULL);
 
@@ -928,12 +1109,12 @@ static char *setup_attach_socket(void)
 static void setup_terminal_control_fifo()
 {
 	_cleanup_free_ char *ctl_fifo_path = g_build_filename(opt_bundle_path, "ctl", NULL);
-	ninfo("ctl fifo path: %s", ctl_fifo_path);
+	ninfof("ctl fifo path: %s", ctl_fifo_path);
 
 	/* Setup fifo for reading in terminal resize and other stdio control messages */
 
 	if (mkfifo(ctl_fifo_path, 0666) == -1)
-		pexit("Failed to mkfifo at %s", ctl_fifo_path);
+		pexitf("Failed to mkfifo at %s", ctl_fifo_path);
 
 	terminal_ctrl_fd = open(ctl_fifo_path, O_RDONLY|O_NONBLOCK|O_CLOEXEC);
 	if (terminal_ctrl_fd == -1)
@@ -949,7 +1130,7 @@ static void setup_terminal_control_fifo()
 
 	g_unix_fd_add (terminal_ctrl_fd, G_IO_IN, ctrl_cb, NULL);
 
-	ninfo("terminal_ctrl_fd: %d", terminal_ctrl_fd);
+	ninfof("terminal_ctrl_fd: %d", terminal_ctrl_fd);
 }
 
 static void setup_oom_handling(int container_pid)
@@ -965,13 +1146,13 @@ static void setup_oom_handling(int container_pid)
 	_cleanup_free_ char *memory_cgroup_file_path = g_build_filename(memory_cgroup_path, "cgroup.event_control", NULL);
 
 	if ((cfd = open(memory_cgroup_file_path, O_WRONLY | O_CLOEXEC)) == -1) {
-		nwarn("Failed to open %s", memory_cgroup_file_path);
+		nwarnf("Failed to open %s", memory_cgroup_file_path);
 		return;
 	}
 
 	_cleanup_free_ char *memory_cgroup_file_oom_path = g_build_filename(memory_cgroup_path, "memory.oom_control", NULL);
 	if ((ofd = open(memory_cgroup_file_oom_path, O_RDONLY | O_CLOEXEC)) == -1)
-		pexit("Failed to open %s", memory_cgroup_file_oom_path);
+		pexitf("Failed to open %s", memory_cgroup_file_oom_path);
 
 	if ((oom_event_fd = eventfd(0, EFD_CLOEXEC)) == -1)
 		pexit("Failed to create eventfd");
@@ -983,6 +1164,31 @@ static void setup_oom_handling(int container_pid)
 	g_unix_fd_add (oom_event_fd, G_IO_IN, oom_cb, NULL);
 }
 
+static void do_exit_command()
+{
+	gchar **args;
+	size_t n_args = 0;
+
+	/* Count the additional args, if any.  */
+	if (opt_exit_args)
+		for (; opt_exit_args[n_args]; n_args++);
+
+	args = malloc(sizeof (gchar *) * (n_args + 2));
+	if (args == NULL)
+		_exit(EXIT_FAILURE);
+
+	args[0] = opt_exit_command;
+	if (opt_exit_args)
+		for (n_args = 0; opt_exit_args[n_args]; n_args++)
+			args[n_args + 1] = opt_exit_args[n_args];
+	args[n_args + 1] = NULL;
+
+	execve(opt_exit_command, args, NULL);
+
+        /* Should not happen, but better be safe. */
+	_exit(EXIT_FAILURE);
+}
+
 int main(int argc, char *argv[])
 {
 	int ret;
@@ -991,8 +1197,7 @@ int main(int argc, char *argv[])
 	_cleanup_free_ char *csname = NULL;
 	GError *err = NULL;
 	_cleanup_free_ char *contents = NULL;
-	int container_pid = -1;
-	pid_t main_pid, create_pid;
+	pid_t main_pid;
 	/* Used for !terminal cases. */
 	int slavefd_stdin = -1;
 	int slavefd_stdout = -1;
@@ -1017,6 +1222,13 @@ int main(int argc, char *argv[])
 	        g_print("option parsing failed: %s\n", error->message);
 	        exit(1);
 	}
+	if (opt_version) {
+		g_print("conmon version " VERSION "\ncommit: " GIT_COMMIT "\n");
+		exit(0);
+	}
+
+	if (opt_restore_path && opt_exec)
+		nexit("Cannot use 'exec' and 'restore' at the same time.");
 
 	if (opt_cid == NULL)
 		nexit("Container ID not provided. Use --cid");
@@ -1026,6 +1238,8 @@ int main(int argc, char *argv[])
 
 	if (opt_runtime_path == NULL)
 		nexit("Runtime path not provided. Use --runtime");
+	if (access(opt_runtime_path, X_OK) < 0)
+		pexitf("Runtime path %s is not valid", opt_runtime_path);
 
 	if (opt_bundle_path == NULL && !opt_exec) {
 		if (getcwd(cwd, sizeof(cwd)) == NULL) {
@@ -1059,7 +1273,10 @@ int main(int argc, char *argv[])
 		/* Block for an initial write to the start pipe before
 		   spawning any childred or exiting, to ensure the
 		   parent can put us in the right cgroup. */
-		read(start_pipe_fd, buf, BUF_SIZE);
+		num_read = read(start_pipe_fd, buf, BUF_SIZE);
+		if (num_read < 0) {
+			pexit("start-pipe read failed");
+		}
 		close(start_pipe_fd);
 	}
 
@@ -1077,7 +1294,7 @@ int main(int argc, char *argv[])
 	   the parent is waiting for the stdout to end when the intermediate
 	   child dies */
 	if (dup2(dev_null_r, STDIN_FILENO) < 0)
-		pexit("Failed to dup over stdout");
+		pexit("Failed to dup over stdin");
 	if (dup2(dev_null_w, STDOUT_FILENO) < 0)
 		pexit("Failed to dup over stdout");
 	if (dup2(dev_null_w, STDERR_FILENO) < 0)
@@ -1157,11 +1374,50 @@ int main(int argc, char *argv[])
 			 "--pid-file", opt_pid_file,
 			 NULL);
         } else {
+		char *command;
+		if (opt_restore_path)
+			command = "restore";
+		else
+			command = "create";
+
 		add_argv(runtime_argv,
-			 "create",
+			 command,
 			 "--bundle", opt_bundle_path,
 			 "--pid-file", opt_pid_file,
 			 NULL);
+
+		if (opt_restore_path) {
+			/*
+			 * 'runc restore' is different from 'runc create'
+			 * as the container is immediately running after
+			 * a restore. Therefore the '--detach is needed'
+			 * so that runc returns once the container is running.
+			 *
+			 * '--image-path' is the path to the checkpoint
+			 * which will be become important when using pre-copy
+			 * migration where multiple checkpoints can be created
+			 * to reduce the container downtime during migration.
+			 *
+			 * '--work-path' is the directory CRIU will run in and
+			 * also place its log files.
+			 */
+			add_argv(runtime_argv, "--detach",
+				 "--image-path", opt_restore_path,
+				 "--work-path", opt_bundle_path,
+				 NULL);
+		}
+	}
+
+	if (!opt_exec && opt_no_pivot) {
+		add_argv(runtime_argv,
+			"--no-pivot",
+			NULL);
+	}
+
+	if (!opt_exec && opt_no_new_keyring) {
+		add_argv(runtime_argv,
+			"--no-new-keyring",
+			NULL);
 	}
 
 	if (csname != NULL) {
@@ -1181,6 +1437,10 @@ int main(int argc, char *argv[])
 	add_argv(runtime_argv, opt_cid, NULL);
 	end_argv(runtime_argv);
 
+	sigset_t mask, oldmask;
+	if ((sigemptyset(&mask) < 0) || (sigaddset(&mask, SIGTERM) < 0) || (sigaddset(&mask, SIGQUIT) < 0)
+		|| (sigaddset(&mask, SIGINT) < 0) || sigprocmask (SIG_BLOCK, &mask, &oldmask) < 0)
+		pexit("Failed to block signals");
 	/*
 	 * We have to fork here because the current runC API dups the stdio of the
 	 * calling process over the container's fds. This is actually *very bad*
@@ -1195,6 +1455,11 @@ int main(int argc, char *argv[])
 		pexit("Failed to fork the create command");
 	} else if (!create_pid) {
 		/* FIXME: This results in us not outputting runc error messages to crio's log. */
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0)
+			pexit("Failed to set PDEATHSIG");
+		if (sigprocmask (SIG_SETMASK, &oldmask, NULL) < 0)
+			pexit("Failed to unblock signals");
+
 		if (slavefd_stdin < 0)
 			slavefd_stdin = dev_null_r;
 		if (dup2(slavefd_stdin, STDIN_FILENO) < 0)
@@ -1210,9 +1475,36 @@ int main(int argc, char *argv[])
 		if (dup2(slavefd_stderr, STDERR_FILENO) < 0)
 			pexit("Failed to dup over stderr");
 
+		/* If LISTEN_PID env is set, we need to set the LISTEN_PID
+		   it to the new child process */
+		char *listenpid = getenv("LISTEN_PID");
+		if (listenpid != NULL) {
+			errno=0;
+			int lpid = strtol(listenpid, NULL, 10);
+			if (errno != 0 || lpid <=0)
+				pexitf("Invalid LISTEN_PID %s", listenpid);
+			if (opt_replace_listen_pid || lpid == getppid()) {
+				gchar *pidstr = g_strdup_printf("%d", getpid());
+				if (!pidstr)
+					pexit("Failed to g_strdup_sprintf pid");
+				if (setenv("LISTEN_PID",pidstr,true) < 0)
+					pexit("Failed to setenv LISTEN_PID");
+				free(pidstr);
+			}
+		}
+
 		execv(g_ptr_array_index(runtime_argv,0), (char **)runtime_argv->pdata);
 		exit(127);
 	}
+
+	if ((signal(SIGTERM, on_sig_exit) == SIG_ERR) || (signal(SIGQUIT, on_sig_exit) == SIG_ERR) || (signal(SIGINT, on_sig_exit) == SIG_ERR))
+		pexit("Failed to register the signal handler");
+
+	if (sigprocmask (SIG_SETMASK, &oldmask, NULL) < 0)
+		pexit("Failed to unblock signals");
+
+	if (opt_exit_command)
+		atexit(do_exit_command);
 
 	g_ptr_array_free (runtime_argv, TRUE);
 
@@ -1221,20 +1513,39 @@ int main(int argc, char *argv[])
 	close(slavefd_stdout);
 	close(slavefd_stderr);
 
-	ninfo("about to waitpid: %d", create_pid);
+	/* Map pid to its handler.  */
+	GHashTable *pid_to_handler = g_hash_table_new (g_int_hash, g_int_equal);
+	g_hash_table_insert (pid_to_handler, (pid_t *) &create_pid, runtime_exit_cb);
+
+	/*
+	 * Glib does not support SIGCHLD so use SIGUSR1 with the same semantic.  We will
+         * catch SIGCHLD and raise(SIGUSR1) in the signal handler.
+	 */
+	g_unix_signal_add(SIGUSR1, on_sigusr1_cb, pid_to_handler);
+
+	if (signal(SIGCHLD, on_sigchld) == SIG_ERR)
+		pexit("Failed to set handler for SIGCHLD");
+
+	ninfof("about to waitpid: %d", create_pid);
 	if (csname != NULL) {
 		guint terminal_watch = g_unix_fd_add (console_socket_fd, G_IO_IN, terminal_accept_cb, csname);
-		g_child_watch_add (create_pid, runtime_exit_cb, NULL);
+		/* Process any SIGCHLD we may have missed before the signal handler was in place.  */
+		check_child_processes (pid_to_handler);
 		g_main_loop_run (main_loop);
 		g_source_remove (terminal_watch);
 	} else {
+		int ret;
 		/* Wait for our create child to exit with the return code. */
-		if (waitpid(create_pid, &runtime_status, 0) < 0) {
+		do
+			ret = waitpid(create_pid, &runtime_status, 0);
+		while (ret < 0 && errno == EINTR);
+		if (ret < 0) {
 			int old_errno = errno;
 			kill(create_pid, SIGKILL);
 			errno = old_errno;
-			pexit("Failed to wait for `runtime %s`", opt_exec ? "exec" : "create");
+			pexitf("Failed to wait for `runtime %s`", opt_exec ? "exec" : "create");
 		}
+
 	}
 
 	if (!WIFEXITED(runtime_status) || WEXITSTATUS(runtime_status) != 0) {
@@ -1249,7 +1560,7 @@ int main(int argc, char *argv[])
 				write_sync_fd(sync_pipe_fd, -1, buf);
 			}
 		}
-		nexit("Failed to create container: exit status %d", WEXITSTATUS(runtime_status));
+		nexitf("Failed to create container: exit status %d", WEXITSTATUS(runtime_status));
 	}
 
 	if (opt_terminal && masterfd_stdout == -1)
@@ -1258,13 +1569,15 @@ int main(int argc, char *argv[])
 	/* Read the pid so we can wait for the process to exit */
 	g_file_get_contents(opt_pid_file, &contents, NULL, &err);
 	if (err) {
-		nwarn("Failed to read pidfile: %s", err->message);
+		nwarnf("Failed to read pidfile: %s", err->message);
 		g_error_free(err);
 		exit(1);
 	}
 
 	container_pid = atoi(contents);
-	ninfo("container PID: %d", container_pid);
+	ninfof("container PID: %d", container_pid);
+
+	g_hash_table_insert (pid_to_handler, (pid_t *) &container_pid, container_exit_cb);
 
 	/* Setup endpoint for attach */
 	_cleanup_free_ char *attach_symlink_dir_path = NULL;
@@ -1294,7 +1607,7 @@ int main(int argc, char *argv[])
 		g_timeout_add_seconds (opt_timeout, timeout_cb, NULL);
 	}
 
-	g_child_watch_add (container_pid, container_exit_cb, NULL);
+	check_child_processes(pid_to_handler);
 
 	g_main_loop_run (main_loop);
 
@@ -1320,12 +1633,15 @@ int main(int argc, char *argv[])
 		exit_status = WEXITSTATUS(container_status);
 	}
 
-	if (!opt_exec) {
+	if (opt_exit_dir) {
 		_cleanup_free_ char *status_str = g_strdup_printf("%d", exit_status);
-		if (!g_file_set_contents("exit", status_str, -1, &err))
-			nexit("Failed to write %s to exit file: %s\n",
+		_cleanup_free_ char *exit_file_path = g_build_filename(opt_exit_dir, opt_cid, NULL);
+		if (!g_file_set_contents(exit_file_path, status_str, -1, &err))
+			nexitf("Failed to write %s to exit file: %s",
 			      status_str, err->message);
-	} else {
+	}
+
+	if (opt_exec) {
 		/* Send the command exec exit code back to the parent */
 		write_sync_fd(sync_pipe_fd, exit_status, exit_message);
 	}

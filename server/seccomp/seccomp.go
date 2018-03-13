@@ -6,27 +6,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"syscall"
 
 	"github.com/docker/docker/pkg/stringutils"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	libseccomp "github.com/seccomp/libseccomp-golang"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 // IsEnabled returns true if seccomp is enabled for the host.
 func IsEnabled() bool {
-	// seccompModeFilter refers to the syscall argument SECCOMP_MODE_FILTER.
-	const seccompModeFilter = uintptr(2)
-
 	enabled := false
 	// Check if Seccomp is supported, via CONFIG_SECCOMP.
-	if _, _, err := syscall.RawSyscall(syscall.SYS_PRCTL, syscall.PR_GET_SECCOMP, 0, 0); err != syscall.EINVAL {
+	if err := unix.Prctl(unix.PR_GET_SECCOMP, 0, 0, 0, 0); err != unix.EINVAL {
 		// Make sure the kernel has CONFIG_SECCOMP_FILTER.
-		if _, _, err := syscall.RawSyscall(syscall.SYS_PRCTL, syscall.PR_SET_SECCOMP, seccompModeFilter, 0); err != syscall.EINVAL {
+		if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, 0, 0, 0); err != unix.EINVAL {
 			enabled = true
 		}
 	}
+	logrus.Debugf("seccomp status: %v", enabled)
 	return enabled
 }
 

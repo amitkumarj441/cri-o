@@ -6,13 +6,11 @@
 	"image": {
 		"image": "redis:alpine"
 	},
-	"command": [
-		"/bin/bash"
-	],
 	"args": [
-		"/bin/chmod", "777", "."
+                "docker-entrypoint.sh",
+                "redis-server"
 	],
-	"working_dir": "/",
+	"working_dir": "/data",
 	"envs": [
 		{
 			"key": "PATH",
@@ -53,20 +51,20 @@
 			"oom_score_adj": 30
 		},
 		"security_context": {
+			"seccomp_profile_path": "%VALUE%",
 			"capabilities": {
 				"add_capabilities": [
 					"setuid",
 					"setgid"
 				],
 				"drop_capabilities": [
-					"audit_read"
 				]
 			},
 			"selinux_options": {
 				"user": "system_u",
 				"role": "system_r",
 				"type": "svirt_lxc_net_t",
-				"level": "s0:c4-c5"
+				"level": "s0:c4,c5"
 			}
 		}
 	}

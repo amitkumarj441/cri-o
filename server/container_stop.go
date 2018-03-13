@@ -1,38 +1,28 @@
 package server
 
 import (
-	"fmt"
+	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/kubernetes-incubator/cri-o/oci"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 // StopContainer stops a running container with a grace period (i.e., timeout).
-func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (*pb.StopContainerResponse, error) {
+func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (resp *pb.StopContainerResponse, err error) {
+	const operation = "stop_container"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("StopContainerRequest %+v", req)
-	c, err := s.getContainerFromRequest(req.ContainerId)
+
+	_, err = s.ContainerServer.ContainerStop(ctx, req.ContainerId, req.Timeout)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.runtime.UpdateStatus(c); err != nil {
-		return nil, err
-	}
-	cStatus := s.runtime.ContainerStatus(c)
-	if cStatus.Status != oci.ContainerStateStopped {
-		if err := s.runtime.StopContainer(c, req.Timeout); err != nil {
-			return nil, fmt.Errorf("failed to stop container %s: %v", c.ID(), err)
-		}
-		if err := s.storageRuntimeServer.StopContainer(c.ID()); err != nil {
-			return nil, fmt.Errorf("failed to unmount container %s: %v", c.ID(), err)
-		}
-	}
-
-	s.containerStateToDisk(c)
-
-	resp := &pb.StopContainerResponse{}
-	logrus.Debugf("StopContainerResponse: %+v", resp)
+	resp = &pb.StopContainerResponse{}
+	logrus.Debugf("StopContainerResponse %s: %+v", req.ContainerId, resp)
 	return resp, nil
 }

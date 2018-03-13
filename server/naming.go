@@ -5,12 +5,12 @@ import (
 	"strings"
 
 	"github.com/docker/docker/pkg/stringid"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 const (
 	kubePrefix    = "k8s"
-	infraName     = "infra"
+	infraName     = "POD"
 	nameDelimiter = "_"
 )
 
@@ -54,7 +54,7 @@ func (s *Server) generatePodIDandName(sandboxConfig *pb.PodSandboxConfig) (strin
 	if sandboxConfig.Metadata.Namespace == "" {
 		return "", "", fmt.Errorf("cannot generate pod ID without namespace")
 	}
-	name, err := s.reservePodName(id, makeSandboxName(sandboxConfig))
+	name, err := s.ReservePodName(id, makeSandboxName(sandboxConfig))
 	if err != nil {
 		return "", "", err
 	}
@@ -66,7 +66,7 @@ func (s *Server) generateContainerIDandNameForSandbox(sandboxConfig *pb.PodSandb
 		err error
 		id  = stringid.GenerateNonCryptoID()
 	)
-	name, err := s.reserveContainerName(id, makeSandboxContainerName(sandboxConfig))
+	name, err := s.ReserveContainerName(id, makeSandboxContainerName(sandboxConfig))
 	if err != nil {
 		return "", "", err
 	}
@@ -78,7 +78,7 @@ func (s *Server) generateContainerIDandName(sandboxMetadata *pb.PodSandboxMetada
 		err error
 		id  = stringid.GenerateNonCryptoID()
 	)
-	name, err := s.reserveContainerName(id, makeContainerName(sandboxMetadata, containerConfig))
+	name, err := s.ReserveContainerName(id, makeContainerName(sandboxMetadata, containerConfig))
 	if err != nil {
 		return "", "", err
 	}

@@ -5,12 +5,23 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/cri-o/ocicni/pkg/ocicni"
+	"github.com/kubernetes-incubator/cri-o/lib/sandbox"
+	"github.com/kubernetes-incubator/cri-o/server/metrics"
+	"github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/opencontainers/runtime-tools/validate"
+	"github.com/syndtr/gocapability/capability"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 const (
 	// According to http://man7.org/linux/man-pages/man5/resolv.conf.5.html:
 	// "The search list is currently limited to six domains with a total of 256 characters."
 	maxDNSSearches = 6
+
+	maxLabelSize = 4096
 )
 
 func copyFile(src, dest string) error {
@@ -143,4 +154,102 @@ func SysctlsFromPodAnnotation(annotation string) ([]Sysctl, error) {
 		sysctls[i].Value = cs[1]
 	}
 	return sysctls, nil
+}
+
+func newPodNetwork(sb *sandbox.Sandbox) ocicni.PodNetwork {
+	return ocicni.PodNetwork{
+		Name:      sb.KubeName(),
+		Namespace: sb.Namespace(),
+		ID:        sb.ID(),
+		NetNS:     sb.NetNsPath(),
+	}
+}
+
+// inStringSlice checks whether a string is inside a string slice.
+// Comparison is case insensitive.
+func inStringSlice(ss []string, str string) bool {
+	for _, s := range ss {
+		if strings.ToLower(s) == strings.ToLower(str) {
+			return true
+		}
+	}
+	return false
+}
+
+// getOCICapabilitiesList returns a list of all available capabilities.
+func getOCICapabilitiesList() []string {
+	var caps []string
+	for _, cap := range capability.List() {
+		if cap > validate.LastCap() {
+			continue
+		}
+		caps = append(caps, "CAP_"+strings.ToUpper(cap.String()))
+	}
+	return caps
+}
+
+func recordOperation(operation string, start time.Time) {
+	metrics.CRIOOperations.WithLabelValues(operation).Inc()
+	metrics.CRIOOperationsLatency.WithLabelValues(operation).Observe(metrics.SinceInMicroseconds(start))
+}
+
+// recordError records error for metric if an error occurred.
+func recordError(operation string, err error) {
+	if err != nil {
+		// TODO(runcom): handle timeout from ctx as well
+		metrics.CRIOOperationsErrors.WithLabelValues(operation).Inc()
+	}
+}
+
+func validateLabels(labels map[string]string) error {
+	for k, v := range labels {
+		if (len(k) + len(v)) > maxLabelSize {
+			if len(k) > 10 {
+				k = k[:10]
+			}
+			return fmt.Errorf("label key and value greater than maximum size (%d bytes), key: %s", maxLabelSize, k)
+		}
+	}
+	return nil
+}
+
+func mergeEnvs(imageConfig *v1.Image, kubeEnvs []*pb.KeyValue) []string {
+	envs := []string{}
+	if kubeEnvs == nil && imageConfig != nil {
+		envs = imageConfig.Config.Env
+	} else {
+		for _, item := range kubeEnvs {
+			if item.GetKey() == "" {
+				continue
+			}
+			envs = append(envs, item.GetKey()+"="+item.GetValue())
+		}
+		if imageConfig != nil {
+			for _, imageEnv := range imageConfig.Config.Env {
+				var found bool
+				parts := strings.SplitN(imageEnv, "=", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				imageEnvKey := parts[0]
+				if imageEnvKey == "" {
+					continue
+				}
+				for _, kubeEnv := range envs {
+					kubeEnvKey := strings.SplitN(kubeEnv, "=", 2)[0]
+					if kubeEnvKey == "" {
+						continue
+					}
+					if imageEnvKey == kubeEnvKey {
+						found = true
+						break
+					}
+				}
+				if !found {
+					envs = append(envs, imageEnv)
+				}
+			}
+		}
+	}
+	return envs
 }

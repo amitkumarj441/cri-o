@@ -5,7 +5,7 @@
 		"namespace": "redhat.test.crio",
 		"attempt": 1
 	},
-	"hostname": "crioctl_host",
+	"hostname": "crictl_host",
 	"log_directory": "",
 	"dns_config": {
 		"searches": [
@@ -28,8 +28,6 @@
 	},
 	"annotations": {
 		"owner": "hmeng",
-		"security.alpha.kubernetes.io/sysctls": "kernel.shm_rmid_forced=1,net.ipv4.ip_local_port_range=1024 65000",
-		"security.alpha.kubernetes.io/unsafe-sysctls": "kernel.msgmax=8192" ,
 		"security.alpha.kubernetes.io/seccomp/pod": "unconfined"
 	},
 	"linux": {
@@ -39,6 +37,12 @@
 				"host_network": false,
 				"host_pid": false,
 				"host_ipc": false
+			},
+			"selinux_options": {
+				"user": "system_u",
+				"role": "system_r",
+				"type": "svirt_lxc_net_t",
+				"level": "s0:c4,c5"
 			}
 		}
 	}

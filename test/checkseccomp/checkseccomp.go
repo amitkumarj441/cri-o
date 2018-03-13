@@ -2,19 +2,15 @@ package main
 
 import (
 	"os"
-	"syscall"
-)
 
-const (
-	// SeccompModeFilter refers to the syscall argument SECCOMP_MODE_FILTER.
-	SeccompModeFilter = uintptr(2)
+	"golang.org/x/sys/unix"
 )
 
 func main() {
 	// Check if Seccomp is supported, via CONFIG_SECCOMP.
-	if _, _, err := syscall.RawSyscall(syscall.SYS_PRCTL, syscall.PR_GET_SECCOMP, 0, 0); err != syscall.EINVAL {
+	if err := unix.Prctl(unix.PR_GET_SECCOMP, 0, 0, 0, 0); err != unix.EINVAL {
 		// Make sure the kernel has CONFIG_SECCOMP_FILTER.
-		if _, _, err := syscall.RawSyscall(syscall.SYS_PRCTL, syscall.PR_SET_SECCOMP, SeccompModeFilter, 0); err != syscall.EINVAL {
+		if err := unix.Prctl(unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER, 0, 0, 0); err != unix.EINVAL {
 			os.Exit(0)
 		}
 	}

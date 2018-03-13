@@ -6,20 +6,25 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/kubernetes-incubator/cri-o/oci"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 // PortForward prepares a streaming endpoint to forward ports from a PodSandbox.
-func (s *Server) PortForward(ctx context.Context, req *pb.PortForwardRequest) (*pb.PortForwardResponse, error) {
+func (s *Server) PortForward(ctx context.Context, req *pb.PortForwardRequest) (resp *pb.PortForwardResponse, err error) {
+	const operation = "port_forward"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("PortForwardRequest %+v", req)
 
-	resp, err := s.GetPortForward(req)
-
+	resp, err = s.GetPortForward(req)
 	if err != nil {
 		return nil, fmt.Errorf("unable to prepare portforward endpoint")
 	}
@@ -34,11 +39,11 @@ func (ss streamService) PortForward(podSandboxID string, port int32, stream io.R
 		return fmt.Errorf("could not find container for sandbox %q", podSandboxID)
 	}
 
-	if err := ss.runtimeServer.runtime.UpdateStatus(c); err != nil {
+	if err := ss.runtimeServer.Runtime().UpdateStatus(c); err != nil {
 		return err
 	}
 
-	cState := ss.runtimeServer.runtime.ContainerStatus(c)
+	cState := ss.runtimeServer.Runtime().ContainerStatus(c)
 	if !(cState.Status == oci.ContainerStateRunning || cState.Status == oci.ContainerStateCreated) {
 		return fmt.Errorf("container is not created or running")
 	}

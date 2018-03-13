@@ -2,26 +2,32 @@ package server
 
 import (
 	"fmt"
+	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/kubernetes-incubator/cri-o/oci"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
 // ExecSync runs a command in a container synchronously.
-func (s *Server) ExecSync(ctx context.Context, req *pb.ExecSyncRequest) (*pb.ExecSyncResponse, error) {
+func (s *Server) ExecSync(ctx context.Context, req *pb.ExecSyncRequest) (resp *pb.ExecSyncResponse, err error) {
+	const operation = "exec_sync"
+	defer func() {
+		recordOperation(operation, time.Now())
+		recordError(operation, err)
+	}()
 	logrus.Debugf("ExecSyncRequest %+v", req)
-	c, err := s.getContainerFromRequest(req.ContainerId)
+	c, err := s.GetContainerFromRequest(req.ContainerId)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = s.runtime.UpdateStatus(c); err != nil {
+	if err = s.Runtime().UpdateStatus(c); err != nil {
 		return nil, err
 	}
 
-	cState := s.runtime.ContainerStatus(c)
+	cState := s.Runtime().ContainerStatus(c)
 	if !(cState.Status == oci.ContainerStateRunning || cState.Status == oci.ContainerStateCreated) {
 		return nil, fmt.Errorf("container is not created or running")
 	}
@@ -31,11 +37,11 @@ func (s *Server) ExecSync(ctx context.Context, req *pb.ExecSyncRequest) (*pb.Exe
 		return nil, fmt.Errorf("exec command cannot be empty")
 	}
 
-	execResp, err := s.runtime.ExecSync(c, cmd, req.Timeout)
+	execResp, err := s.Runtime().ExecSync(c, cmd, req.Timeout)
 	if err != nil {
 		return nil, err
 	}
-	resp := &pb.ExecSyncResponse{
+	resp = &pb.ExecSyncResponse{
 		Stdout:   execResp.Stdout,
 		Stderr:   execResp.Stderr,
 		ExitCode: execResp.ExitCode,

@@ -1,34 +1,47 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
+	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/containers/storage/pkg/reexec"
+	"github.com/kubernetes-incubator/cri-o/lib"
+	"github.com/kubernetes-incubator/cri-o/oci"
 	"github.com/kubernetes-incubator/cri-o/server"
-	"github.com/opencontainers/selinux/go-selinux"
+	"github.com/kubernetes-incubator/cri-o/version"
+	"github.com/sirupsen/logrus"
+	"github.com/soheilhy/cmux"
 	"github.com/urfave/cli"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
-	"k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	runtime "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 )
 
-const crioConfigPath = "/etc/crio/crio.conf"
+// gitCommit is the commit that the binary is being built from.
+// It will be populated by the Makefile.
+var gitCommit = ""
 
 func validateConfig(config *server.Config) error {
 	switch config.ImageVolumes {
-	case server.ImageVolumesMkdir:
-	case server.ImageVolumesIgnore:
+	case lib.ImageVolumesMkdir:
+	case lib.ImageVolumesIgnore:
+	case lib.ImageVolumesBind:
 	default:
 		return fmt.Errorf("Unrecognized image volume type specified")
 
+	}
+
+	if config.LogSizeMax >= 0 && config.LogSizeMax < oci.BufSize {
+		return fmt.Errorf("log size max should be negative or >= %d", oci.BufSize)
 	}
 	return nil
 }
@@ -36,7 +49,7 @@ func validateConfig(config *server.Config) error {
 func mergeConfig(config *server.Config, ctx *cli.Context) error {
 	// Don't parse the config if the user explicitly set it to "".
 	if path := ctx.GlobalString("config"); path != "" {
-		if err := config.FromFile(path); err != nil {
+		if err := config.UpdateFromFile(path); err != nil {
 			if ctx.GlobalIsSet("config") || !os.IsNotExist(err) {
 				return err
 			}
@@ -44,7 +57,7 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 			// We don't error out if --config wasn't explicitly set and the
 			// default doesn't exist. But we will log a warning about it, so
 			// the user doesn't miss it.
-			logrus.Warnf("default configuration file does not exist: %s", crioConfigPath)
+			logrus.Warnf("default configuration file does not exist: %s", server.CrioConfigPath)
 		}
 	}
 
@@ -73,8 +86,14 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 	if ctx.GlobalIsSet("storage-opt") {
 		config.StorageOptions = ctx.GlobalStringSlice("storage-opt")
 	}
+	if ctx.GlobalIsSet("file-locking") {
+		config.FileLocking = ctx.GlobalBool("file-locking")
+	}
 	if ctx.GlobalIsSet("insecure-registry") {
 		config.InsecureRegistries = ctx.GlobalStringSlice("insecure-registry")
+	}
+	if ctx.GlobalIsSet("registry") {
+		config.Registries = ctx.GlobalStringSlice("registry")
 	}
 	if ctx.GlobalIsSet("default-transport") {
 		config.DefaultTransport = ctx.GlobalString("default-transport")
@@ -103,6 +122,18 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 	if ctx.GlobalIsSet("cgroup-manager") {
 		config.CgroupManager = ctx.GlobalString("cgroup-manager")
 	}
+	if ctx.GlobalIsSet("hooks-dir-path") {
+		config.HooksDirPath = ctx.GlobalString("hooks-dir-path")
+	}
+	if ctx.GlobalIsSet("default-mounts") {
+		config.DefaultMounts = ctx.GlobalStringSlice("default-mounts")
+	}
+	if ctx.GlobalIsSet("pids-limit") {
+		config.PidsLimit = ctx.GlobalInt64("pids-limit")
+	}
+	if ctx.GlobalIsSet("log-size-max") {
+		config.LogSizeMax = ctx.GlobalInt64("log-size-max")
+	}
 	if ctx.GlobalIsSet("cni-config-dir") {
 		config.NetworkDir = ctx.GlobalString("cni-config-dir")
 	}
@@ -110,26 +141,32 @@ func mergeConfig(config *server.Config, ctx *cli.Context) error {
 		config.PluginDir = ctx.GlobalString("cni-plugin-dir")
 	}
 	if ctx.GlobalIsSet("image-volumes") {
-		config.ImageVolumes = server.ImageVolumesType(ctx.GlobalString("image-volumes"))
+		config.ImageVolumes = lib.ImageVolumesType(ctx.GlobalString("image-volumes"))
 	}
 	return nil
 }
 
-func catchShutdown(gserver *grpc.Server, sserver *server.Server, signalled *bool) {
+func catchShutdown(gserver *grpc.Server, sserver *server.Server, hserver *http.Server, signalled *bool) {
 	sig := make(chan os.Signal, 10)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sig, unix.SIGINT, unix.SIGTERM)
 	go func() {
 		for s := range sig {
 			switch s {
-			case syscall.SIGINT:
+			case unix.SIGINT:
 				logrus.Debugf("Caught SIGINT")
-			case syscall.SIGTERM:
+			case unix.SIGTERM:
 				logrus.Debugf("Caught SIGTERM")
 			default:
 				continue
 			}
 			*signalled = true
 			gserver.GracefulStop()
+			hserver.Shutdown(context.Background())
+			sserver.StopStreamServer()
+			sserver.StopMonitors()
+			if err := sserver.Shutdown(); err != nil {
+				logrus.Warnf("error shutting down main service %v", err)
+			}
 			return
 		}
 	}()
@@ -140,9 +177,15 @@ func main() {
 		return
 	}
 	app := cli.NewApp()
+
+	var v []string
+	v = append(v, version.Version)
+	if gitCommit != "" {
+		v = append(v, fmt.Sprintf("commit: %s", gitCommit))
+	}
 	app.Name = "crio"
 	app.Usage = "crio server"
-	app.Version = "1.0.0-alpha.0"
+	app.Version = strings.Join(v, "\n")
 	app.Metadata = map[string]interface{}{
 		"config": server.DefaultConfig(),
 	}
@@ -150,16 +193,12 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{
 			Name:  "config",
-			Value: crioConfigPath,
+			Value: server.CrioConfigPath,
 			Usage: "path to configuration file",
 		},
 		cli.StringFlag{
 			Name:  "conmon",
 			Usage: "path to the conmon executable",
-		},
-		cli.BoolFlag{
-			Name:  "debug",
-			Usage: "enable debug output for logging",
 		},
 		cli.StringFlag{
 			Name:  "listen",
@@ -183,6 +222,11 @@ func main() {
 			Value: "text",
 			Usage: "set the format used by logs ('text' (default), or 'json')",
 		},
+		cli.StringFlag{
+			Name:  "log-level",
+			Usage: "log messages above specified level: debug, info (default), warn, error, fatal or panic",
+		},
+
 		cli.StringFlag{
 			Name:  "pause-command",
 			Usage: "name of the pause command in the pause image",
@@ -211,9 +255,17 @@ func main() {
 			Name:  "storage-opt",
 			Usage: "storage driver option",
 		},
+		cli.BoolFlag{
+			Name:  "file-locking",
+			Usage: "enable or disable file-based locking",
+		},
 		cli.StringSliceFlag{
 			Name:  "insecure-registry",
 			Usage: "whether to disable TLS verification for the given registry",
+		},
+		cli.StringSliceFlag{
+			Name:  "registry",
+			Usage: "registry to be prepended when pulling unqualified images, can be specified multiple times",
 		},
 		cli.StringFlag{
 			Name:  "default-transport",
@@ -239,6 +291,16 @@ func main() {
 			Name:  "cgroup-manager",
 			Usage: "cgroup manager (cgroupfs or systemd)",
 		},
+		cli.Int64Flag{
+			Name:  "pids-limit",
+			Value: lib.DefaultPidsLimit,
+			Usage: "maximum number of processes allowed in a container",
+		},
+		cli.Int64Flag{
+			Name:  "log-size-max",
+			Value: lib.DefaultLogSizeMax,
+			Usage: "maximum log size in bytes for a container",
+		},
 		cli.StringFlag{
 			Name:  "cni-config-dir",
 			Usage: "CNI configuration files directory",
@@ -249,12 +311,37 @@ func main() {
 		},
 		cli.StringFlag{
 			Name:  "image-volumes",
-			Value: string(server.ImageVolumesMkdir),
-			Usage: "image volume handling ('mkdir' or 'ignore')",
+			Value: string(lib.ImageVolumesMkdir),
+			Usage: "image volume handling ('mkdir', 'bind', or 'ignore')",
+		},
+		cli.StringFlag{
+			Name:   "hooks-dir-path",
+			Usage:  "set the OCI hooks directory path",
+			Value:  lib.DefaultHooksDirPath,
+			Hidden: true,
+		},
+		cli.StringSliceFlag{
+			Name:   "default-mounts",
+			Usage:  "add one or more default mount paths in the form host:container",
+			Hidden: true,
 		},
 		cli.BoolFlag{
 			Name:  "profile",
 			Usage: "enable pprof remote profiler on localhost:6060",
+		},
+		cli.IntFlag{
+			Name:  "profile-port",
+			Value: 6060,
+			Usage: "port for the pprof profiler",
+		},
+		cli.BoolFlag{
+			Name:  "enable-metrics",
+			Usage: "enable metrics endpoint for the servier on localhost:9090",
+		},
+		cli.IntFlag{
+			Name:  "metrics-port",
+			Value: 9090,
+			Usage: "port for the metrics endpoint",
 		},
 	}
 
@@ -283,8 +370,13 @@ func main() {
 
 		logrus.SetFormatter(cf)
 
-		if c.GlobalBool("debug") {
-			logrus.SetLevel(logrus.DebugLevel)
+		if loglevel := c.GlobalString("log-level"); loglevel != "" {
+			level, err := logrus.ParseLevel(loglevel)
+			if err != nil {
+				return err
+			}
+
+			logrus.SetLevel(level)
 		}
 
 		if path := c.GlobalString("log"); path != "" {
@@ -309,20 +401,36 @@ func main() {
 
 	app.Action = func(c *cli.Context) error {
 		if c.GlobalBool("profile") {
+			profilePort := c.GlobalInt("profile-port")
+			profileEndpoint := fmt.Sprintf("localhost:%v", profilePort)
 			go func() {
-				http.ListenAndServe("localhost:6060", nil)
+				http.ListenAndServe(profileEndpoint, nil)
 			}()
+		}
+
+		args := c.Args()
+		if len(args) > 0 {
+			for _, command := range app.Commands {
+				if args[0] == command.Name {
+					break
+				}
+			}
+			return fmt.Errorf("command %q not supported", args[0])
 		}
 
 		config := c.App.Metadata["config"].(*server.Config)
 
 		if !config.SELinux {
-			selinux.SetDisabled()
+			disableSELinux()
 		}
 
 		if _, err := os.Stat(config.Runtime); os.IsNotExist(err) {
 			// path to runtime does not exist
 			return fmt.Errorf("invalid --runtime value %q", err)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(config.Listen), 0755); err != nil {
+			return err
 		}
 
 		// Remove the socket if it already exists
@@ -343,26 +451,81 @@ func main() {
 			logrus.Fatal(err)
 		}
 
-		graceful := false
-		catchShutdown(s, service, &graceful)
+		if c.GlobalBool("enable-metrics") {
+			metricsPort := c.GlobalInt("metrics-port")
+			me, err := service.CreateMetricsEndpoint()
+			if err != nil {
+				logrus.Fatalf("Failed to create metrics endpoint: %v", err)
+			}
+			l, err := net.Listen("tcp", fmt.Sprintf(":%v", metricsPort))
+			if err != nil {
+				logrus.Fatalf("Failed to create listener for metrics: %v", err)
+			}
+			go func() {
+				if err := http.Serve(l, me); err != nil {
+					logrus.Fatalf("Failed to serve metrics endpoint: %v", err)
+				}
+			}()
+		}
+
 		runtime.RegisterRuntimeServiceServer(s, service)
 		runtime.RegisterImageServiceServer(s, service)
 
 		// after the daemon is done setting up we can notify systemd api
 		notifySystem()
 
-		err = s.Serve(lis)
-		if graceful && strings.Contains(strings.ToLower(err.Error()), "use of closed network connection") {
-			err = nil
+		go func() {
+			service.StartExitMonitor()
+		}()
+		go func() {
+			service.StartHooksMonitor()
+		}()
+
+		m := cmux.New(lis)
+		grpcL := m.Match(cmux.HTTP2HeaderField("content-type", "application/grpc"))
+		httpL := m.Match(cmux.HTTP1Fast())
+
+		infoMux := service.GetInfoMux()
+		srv := &http.Server{
+			Handler:     infoMux,
+			ReadTimeout: 5 * time.Second,
 		}
 
-		if err2 := service.Shutdown(); err2 != nil {
-			logrus.Infof("error shutting down layer storage: %v", err2)
+		graceful := false
+		catchShutdown(s, service, srv, &graceful)
+
+		go s.Serve(grpcL)
+		go srv.Serve(httpL)
+
+		serverCloseCh := make(chan struct{})
+		go func() {
+			defer close(serverCloseCh)
+			if err := m.Serve(); err != nil {
+				if graceful && strings.Contains(strings.ToLower(err.Error()), "use of closed network connection") {
+					err = nil
+				} else {
+					logrus.Errorf("Failed to serve grpc request: %v", err)
+				}
+			}
+		}()
+
+		streamServerCloseCh := service.StreamingServerCloseChan()
+		serverMonitorsCh := service.MonitorsCloseChan()
+		select {
+		case <-streamServerCloseCh:
+		case <-serverMonitorsCh:
+		case <-serverCloseCh:
 		}
 
-		if err != nil {
-			logrus.Fatal(err)
-		}
+		service.Shutdown()
+
+		<-streamServerCloseCh
+		logrus.Debug("closed stream server")
+		<-serverMonitorsCh
+		logrus.Debug("closed monitors")
+		<-serverCloseCh
+		logrus.Debug("closed main server")
+
 		return nil
 	}
 

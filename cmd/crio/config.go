@@ -28,8 +28,7 @@ storage_driver = "{{ .Storage }}"
 storage_option = [
 {{ range $opt := .StorageOptions }}{{ printf "\t%q,\n" $opt }}{{ end }}]
 
-# The "crio.api" table contains settings for the kubelet/gRPC
-# interface (which is also used by crioctl).
+# The "crio.api" table contains settings for the kubelet/gRPC interface.
 [crio.api]
 
 # listen is the path to the AF_LOCAL socket on which crio will listen.
@@ -40,6 +39,10 @@ stream_address = "{{ .StreamAddress }}"
 
 # stream_port is the port on which the stream server will listen
 stream_port = "{{ .StreamPort }}"
+
+# file_locking is whether file-based locking will be used instead of
+# in-memory locking
+file_locking = {{ .FileLocking }}
 
 # The "crio.runtime" table contains settings pertaining to the OCI
 # runtime used and options for how to set up and manage the OCI runtime.
@@ -73,6 +76,9 @@ runtime_untrusted_workload = "{{ .RuntimeUntrustedWorkload }}"
 # container runtime for all containers.
 default_workload_trust = "{{ .DefaultWorkloadTrust }}"
 
+# no_pivot instructs the runtime to not use pivot_root, but instead use MS_MOVE
+no_pivot = {{ .NoPivot }}
+
 # conmon is the path to conmon binary, used for managing the runtime.
 conmon = "{{ .Conmon }}"
 
@@ -97,6 +103,20 @@ apparmor_profile = "{{ .ApparmorProfile }}"
 # cgroup_manager is the cgroup management implementation to be used
 # for the runtime.
 cgroup_manager = "{{ .CgroupManager }}"
+
+# hooks_dir_path is the oci hooks directory for automatically executed hooks
+hooks_dir_path = "{{ .HooksDirPath }}"
+
+# default_mounts is the mounts list to be mounted for the container when created
+default_mounts = [
+{{ range $mount := .DefaultMounts }}{{ printf "\t%q, \n" $mount }}{{ end }}]
+
+# pids_limit is the number of processes allowed in a container
+pids_limit = {{ .PidsLimit }}
+
+# log_size_max is the max limit for the container log size in bytes.
+# Negative values indicate that no limit is imposed.
+log_size_max = {{ .LogSizeMax }}
 
 # The "crio.image" table contains settings pertaining to the
 # management of OCI images.
@@ -127,6 +147,11 @@ image_volumes = "{{ .ImageVolumes }}"
 # insecure_registries is used to skip TLS verification when pulling images.
 insecure_registries = [
 {{ range $opt := .InsecureRegistries }}{{ printf "\t%q,\n" $opt }}{{ end }}]
+
+# registries is used to specify a comma separated list of registries to be used
+# when pulling an unqualified image (e.g. fedora:rawhide).
+registries = [
+{{ range $opt := .Registries }}{{ printf "\t%q,\n" $opt }}{{ end }}]
 
 # The "crio.network" table contains settings pertaining to the
 # management of CNI plugins.

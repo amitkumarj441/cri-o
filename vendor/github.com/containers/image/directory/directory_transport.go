@@ -5,14 +5,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
-
 	"github.com/containers/image/directory/explicitfilepath"
 	"github.com/containers/image/docker/reference"
 	"github.com/containers/image/image"
 	"github.com/containers/image/transports"
 	"github.com/containers/image/types"
 	"github.com/opencontainers/go-digest"
+	"github.com/pkg/errors"
 )
 
 func init() {
@@ -134,27 +133,30 @@ func (ref dirReference) PolicyConfigurationNamespaces() []string {
 	return res
 }
 
-// NewImage returns a types.Image for this reference, possibly specialized for this ImageTransport.
-// The caller must call .Close() on the returned Image.
+// NewImage returns a types.ImageCloser for this reference, possibly specialized for this ImageTransport.
+// The caller must call .Close() on the returned ImageCloser.
 // NOTE: If any kind of signature verification should happen, build an UnparsedImage from the value returned by NewImageSource,
 // verify that UnparsedImage, and convert it into a real Image via image.FromUnparsedImage.
-func (ref dirReference) NewImage(ctx *types.SystemContext) (types.Image, error) {
+// WARNING: This may not do the right thing for a manifest list, see image.FromSource for details.
+func (ref dirReference) NewImage(ctx *types.SystemContext) (types.ImageCloser, error) {
 	src := newImageSource(ref)
-	return image.FromSource(src)
+	return image.FromSource(ctx, src)
 }
 
-// NewImageSource returns a types.ImageSource for this reference,
-// asking the backend to use a manifest from requestedManifestMIMETypes if possible.
-// nil requestedManifestMIMETypes means manifest.DefaultRequestedManifestMIMETypes.
+// NewImageSource returns a types.ImageSource for this reference.
 // The caller must call .Close() on the returned ImageSource.
-func (ref dirReference) NewImageSource(ctx *types.SystemContext, requestedManifestMIMETypes []string) (types.ImageSource, error) {
+func (ref dirReference) NewImageSource(ctx *types.SystemContext) (types.ImageSource, error) {
 	return newImageSource(ref), nil
 }
 
 // NewImageDestination returns a types.ImageDestination for this reference.
 // The caller must call .Close() on the returned ImageDestination.
 func (ref dirReference) NewImageDestination(ctx *types.SystemContext) (types.ImageDestination, error) {
-	return newImageDestination(ref), nil
+	compress := false
+	if ctx != nil {
+		compress = ctx.DirForceCompress
+	}
+	return newImageDestination(ref, compress)
 }
 
 // DeleteImage deletes the named image from the registry, if supported.
@@ -170,10 +172,15 @@ func (ref dirReference) manifestPath() string {
 // layerPath returns a path for a layer tarball within a directory using our conventions.
 func (ref dirReference) layerPath(digest digest.Digest) string {
 	// FIXME: Should we keep the digest identification?
-	return filepath.Join(ref.path, digest.Hex()+".tar")
+	return filepath.Join(ref.path, digest.Hex())
 }
 
 // signaturePath returns a path for a signature within a directory using our conventions.
 func (ref dirReference) signaturePath(index int) string {
 	return filepath.Join(ref.path, fmt.Sprintf("signature-%d", index+1))
+}
+
+// versionPath returns a path for the version file within a directory using our conventions.
+func (ref dirReference) versionPath() string {
+	return filepath.Join(ref.path, "version")
 }

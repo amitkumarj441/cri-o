@@ -5,7 +5,7 @@
 		"namespace": "redhat.test.crio",
 		"attempt": 1
 	},
-	"hostname": "crioctl_host",
+	"hostname": "crictl_host",
 	"log_directory": "",
 	"dns_options": {
 		"servers": [
@@ -32,22 +32,22 @@
 	},
 	"annotations": {
 		"owner": "hmeng"
-		%VALUE%
 	},
 	"linux": {
 		"cgroup_parent": "/Burstable/pod_123-456",
 		"security_context": {
+			"seccomp_profile_path": "%VALUE%",
 			"namespace_options": {
 				"host_network": false,
 				"host_pid": false,
 				"host_ipc": false
+			},
+			"selinux_options": {
+				"user": "system_u",
+				"role": "system_r",
+				"type": "svirt_lxc_net_t",
+				"level": "s0:c4,c5"
 			}
-		},
-		"selinux_options": {
-			"user": "system_u",
-			"role": "system_r",
-			"type": "container_t",
-			"level": "s0:c1,c2"
 		}
 	}
 }

@@ -5,38 +5,38 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
-	"time"
 
-	"github.com/Sirupsen/logrus"
-	"github.com/containers/image/types"
-	sstorage "github.com/containers/storage"
-	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/registrar"
-	"github.com/docker/docker/pkg/truncindex"
+	"github.com/cri-o/ocicni/pkg/ocicni"
+	"github.com/fsnotify/fsnotify"
+	"github.com/kubernetes-incubator/cri-o/lib"
+	"github.com/kubernetes-incubator/cri-o/lib/sandbox"
 	"github.com/kubernetes-incubator/cri-o/oci"
-	"github.com/kubernetes-incubator/cri-o/pkg/annotations"
-	"github.com/kubernetes-incubator/cri-o/pkg/ocicni"
 	"github.com/kubernetes-incubator/cri-o/pkg/storage"
 	"github.com/kubernetes-incubator/cri-o/server/apparmor"
+	"github.com/kubernetes-incubator/cri-o/server/metrics"
 	"github.com/kubernetes-incubator/cri-o/server/seccomp"
-	rspec "github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/selinux/go-selinux/label"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
 	knet "k8s.io/apimachinery/pkg/util/net"
-	pb "k8s.io/kubernetes/pkg/kubelet/api/v1alpha1/runtime"
+	pb "k8s.io/kubernetes/pkg/kubelet/apis/cri/runtime/v1alpha2"
 	"k8s.io/kubernetes/pkg/kubelet/network/hostport"
 	"k8s.io/kubernetes/pkg/kubelet/server/streaming"
 	iptablesproxy "k8s.io/kubernetes/pkg/proxy/iptables"
 	utildbus "k8s.io/kubernetes/pkg/util/dbus"
-	utilexec "k8s.io/kubernetes/pkg/util/exec"
 	utiliptables "k8s.io/kubernetes/pkg/util/iptables"
+	utilexec "k8s.io/utils/exec"
 )
 
 const (
-	runtimeAPIVersion = "v1alpha1"
-	shutdownFile      = "/var/lib/crio/crio.shutdown"
+	shutdownFile = "/var/lib/crio/crio.shutdown"
 )
 
 func isTrue(annotaton string) bool {
@@ -45,28 +45,20 @@ func isTrue(annotaton string) bool {
 
 // streamService implements streaming.Runtime.
 type streamService struct {
-	runtimeServer *Server // needed by Exec() endpoint
-	streamServer  streaming.Server
+	runtimeServer       *Server // needed by Exec() endpoint
+	streamServer        streaming.Server
+	streamServerCloseCh chan struct{}
 	streaming.Runtime
 }
 
 // Server implements the RuntimeService and ImageService
 type Server struct {
-	config               Config
-	runtime              *oci.Runtime
-	store                sstorage.Store
-	storageImageServer   storage.ImageServer
-	storageRuntimeServer storage.RuntimeServer
-	stateLock            sync.Mutex
-	updateLock           sync.RWMutex
-	state                *serverState
-	netPlugin            ocicni.CNIPlugin
-	hostportManager      hostport.HostPortManager
-	podNameIndex         *registrar.Registrar
-	podIDIndex           *truncindex.TruncIndex
-	ctrNameIndex         *registrar.Registrar
-	ctrIDIndex           *truncindex.TruncIndex
-	imageContext         *types.SystemContext
+	*lib.ContainerServer
+	config Config
+
+	updateLock      sync.RWMutex
+	netPlugin       ocicni.CNIPlugin
+	hostportManager hostport.HostPortManager
 
 	seccompEnabled bool
 	seccompProfile seccomp.Seccomp
@@ -74,7 +66,19 @@ type Server struct {
 	appArmorEnabled bool
 	appArmorProfile string
 
-	stream streamService
+	bindAddress  string
+	stream       streamService
+	monitorsChan chan struct{}
+}
+
+// StopStreamServer stops the stream server
+func (s *Server) StopStreamServer() error {
+	return s.stream.streamServer.Stop()
+}
+
+// StreamingServerCloseChan returns the close channel for the streaming server
+func (s *Server) StreamingServerCloseChan() chan struct{} {
+	return s.stream.streamServerCloseCh
 }
 
 // GetExec returns exec stream request
@@ -92,259 +96,15 @@ func (s *Server) GetPortForward(req *pb.PortForwardRequest) (*pb.PortForwardResp
 	return s.stream.streamServer.GetPortForward(req)
 }
 
-func (s *Server) loadContainer(id string) error {
-	config, err := s.store.FromContainerDirectory(id, "config.json")
-	if err != nil {
-		return err
-	}
-	var m rspec.Spec
-	if err = json.Unmarshal(config, &m); err != nil {
-		return err
-	}
-	labels := make(map[string]string)
-	if err = json.Unmarshal([]byte(m.Annotations[annotations.Labels]), &labels); err != nil {
-		return err
-	}
-	name := m.Annotations[annotations.Name]
-	name, err = s.reserveContainerName(id, name)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		if err != nil {
-			s.releaseContainerName(name)
-		}
-	}()
-
-	var metadata pb.ContainerMetadata
-	if err = json.Unmarshal([]byte(m.Annotations[annotations.Metadata]), &metadata); err != nil {
-		return err
-	}
-	sb := s.getSandbox(m.Annotations[annotations.SandboxID])
-	if sb == nil {
-		return fmt.Errorf("could not get sandbox with id %s, skipping", m.Annotations[annotations.SandboxID])
-	}
-
-	tty := isTrue(m.Annotations[annotations.TTY])
-	stdin := isTrue(m.Annotations[annotations.Stdin])
-	stdinOnce := isTrue(m.Annotations[annotations.StdinOnce])
-
-	containerPath, err := s.store.ContainerRunDirectory(id)
-	if err != nil {
-		return err
-	}
-
-	containerDir, err := s.store.ContainerDirectory(id)
-	if err != nil {
-		return err
-	}
-
-	var img *pb.ImageSpec
-	image, ok := m.Annotations[annotations.Image]
-	if ok {
-		img = &pb.ImageSpec{
-			Image: image,
-		}
-	}
-
-	kubeAnnotations := make(map[string]string)
-	if err = json.Unmarshal([]byte(m.Annotations[annotations.Annotations]), &kubeAnnotations); err != nil {
-		return err
-	}
-
-	created, err := time.Parse(time.RFC3339Nano, m.Annotations[annotations.Created])
-	if err != nil {
-		return err
-	}
-
-	ctr, err := oci.NewContainer(id, name, containerPath, m.Annotations[annotations.LogPath], sb.netNs(), labels, kubeAnnotations, img, &metadata, sb.id, tty, stdin, stdinOnce, sb.privileged, sb.trusted, containerDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
-	if err != nil {
-		return err
-	}
-
-	s.containerStateFromDisk(ctr)
-
-	s.addContainer(ctr)
-	return s.ctrIDIndex.Add(id)
-}
-
-func (s *Server) containerStateFromDisk(c *oci.Container) error {
-	if err := c.FromDisk(); err != nil {
-		return err
-	}
-	// ignore errors, this is a best effort to have up-to-date info about
-	// a given container before its state gets stored
-	s.runtime.UpdateStatus(c)
-
-	return nil
-}
-
-func (s *Server) containerStateToDisk(c *oci.Container) error {
-	// ignore errors, this is a best effort to have up-to-date info about
-	// a given container before its state gets stored
-	s.runtime.UpdateStatus(c)
-
-	jsonSource, err := ioutils.NewAtomicFileWriter(c.StatePath(), 0644)
-	if err != nil {
-		return err
-	}
-	defer jsonSource.Close()
-	enc := json.NewEncoder(jsonSource)
-	return enc.Encode(s.runtime.ContainerStatus(c))
-}
-
-func configNetNsPath(spec rspec.Spec) (string, error) {
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type != rspec.NetworkNamespace {
-			continue
-		}
-
-		if ns.Path == "" {
-			return "", fmt.Errorf("empty networking namespace")
-		}
-
-		return ns.Path, nil
-	}
-
-	return "", fmt.Errorf("missing networking namespace")
-}
-
-func (s *Server) loadSandbox(id string) error {
-	config, err := s.store.FromContainerDirectory(id, "config.json")
-	if err != nil {
-		return err
-	}
-	var m rspec.Spec
-	if err = json.Unmarshal(config, &m); err != nil {
-		return err
-	}
-	labels := make(map[string]string)
-	if err = json.Unmarshal([]byte(m.Annotations[annotations.Labels]), &labels); err != nil {
-		return err
-	}
-	name := m.Annotations[annotations.Name]
-	name, err = s.reservePodName(id, name)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			s.releasePodName(name)
-		}
-	}()
-	var metadata pb.PodSandboxMetadata
-	if err = json.Unmarshal([]byte(m.Annotations[annotations.Metadata]), &metadata); err != nil {
-		return err
-	}
-
-	processLabel, mountLabel, err := label.InitLabels(label.DupSecOpt(m.Process.SelinuxLabel))
-	if err != nil {
-		return err
-	}
-
-	kubeAnnotations := make(map[string]string)
-	if err = json.Unmarshal([]byte(m.Annotations[annotations.Annotations]), &kubeAnnotations); err != nil {
-		return err
-	}
-
-	privileged := isTrue(m.Annotations[annotations.PrivilegedRuntime])
-	trusted := isTrue(m.Annotations[annotations.TrustedSandbox])
-
-	sb := &sandbox{
-		id:           id,
-		name:         name,
-		kubeName:     m.Annotations[annotations.KubeName],
-		logDir:       filepath.Dir(m.Annotations[annotations.LogPath]),
-		labels:       labels,
-		containers:   oci.NewMemoryStore(),
-		processLabel: processLabel,
-		mountLabel:   mountLabel,
-		annotations:  kubeAnnotations,
-		metadata:     &metadata,
-		shmPath:      m.Annotations[annotations.ShmPath],
-		privileged:   privileged,
-		trusted:      trusted,
-		resolvPath:   m.Annotations[annotations.ResolvPath],
-	}
-
-	// We add a netNS only if we can load a permanent one.
-	// Otherwise, the sandbox will live in the host namespace.
-	netNsPath, err := configNetNsPath(m)
-	if err == nil {
-		netNS, nsErr := netNsGet(netNsPath, sb.name)
-		// If we can't load the networking namespace
-		// because it's closed, we just set the sb netns
-		// pointer to nil. Otherwise we return an error.
-		if nsErr != nil && nsErr != errSandboxClosedNetNS {
-			return nsErr
-		}
-
-		sb.netns = netNS
-	}
-
-	s.addSandbox(sb)
-
-	defer func() {
-		if err != nil {
-			s.removeSandbox(sb.id)
-		}
-	}()
-
-	sandboxPath, err := s.store.ContainerRunDirectory(id)
-	if err != nil {
-		return err
-	}
-
-	sandboxDir, err := s.store.ContainerDirectory(id)
-	if err != nil {
-		return err
-	}
-
-	cname, err := s.reserveContainerName(m.Annotations[annotations.ContainerID], m.Annotations[annotations.ContainerName])
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			s.releaseContainerName(cname)
-		}
-	}()
-
-	created, err := time.Parse(time.RFC3339Nano, m.Annotations[annotations.Created])
-	if err != nil {
-		return err
-	}
-
-	scontainer, err := oci.NewContainer(m.Annotations[annotations.ContainerID], cname, sandboxPath, m.Annotations[annotations.LogPath], sb.netNs(), labels, kubeAnnotations, nil, nil, id, false, false, false, privileged, trusted, sandboxDir, created, m.Annotations["org.opencontainers.image.stopSignal"])
-	if err != nil {
-		return err
-	}
-
-	s.containerStateFromDisk(scontainer)
-
-	if err = label.ReserveLabel(processLabel); err != nil {
-		return err
-	}
-	sb.infraContainer = scontainer
-	if err = s.ctrIDIndex.Add(scontainer.ID()); err != nil {
-		return err
-	}
-	if err = s.podIDIndex.Add(id); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (s *Server) restore() {
-	containers, err := s.store.Containers()
-	if err != nil && !os.IsNotExist(err) {
+	containers, err := s.Store().Containers()
+	if err != nil && !os.IsNotExist(errors.Cause(err)) {
 		logrus.Warnf("could not read containers and sandboxes: %v", err)
 	}
 	pods := map[string]*storage.RuntimeContainerMetadata{}
 	podContainers := map[string]*storage.RuntimeContainerMetadata{}
 	for _, container := range containers {
-		metadata, err2 := s.storageRuntimeServer.GetContainerMetadata(container.ID)
+		metadata, err2 := s.StorageRuntimeServer().GetContainerMetadata(container.ID)
 		if err2 != nil {
 			logrus.Warnf("error parsing metadata for %s: %v, ignoring", container.ID, err2)
 			continue
@@ -356,14 +116,22 @@ func (s *Server) restore() {
 		}
 	}
 	for containerID, metadata := range pods {
-		if err = s.loadSandbox(containerID); err != nil {
+		if err = s.LoadSandbox(containerID); err != nil {
 			logrus.Warnf("could not restore sandbox %s container %s: %v", metadata.PodID, containerID, err)
 		}
 	}
 	for containerID := range podContainers {
-		if err := s.loadContainer(containerID); err != nil {
+		if err := s.LoadContainer(containerID); err != nil {
 			logrus.Warnf("could not restore container %s: %v", containerID, err)
 		}
+	}
+	// Restore sandbox IPs
+	for _, sb := range s.ListSandboxes() {
+		ip, err := s.GetSandboxIP(sb)
+		if err != nil {
+			logrus.Warnf("could not restore sandbox IP for %v: %v", sb.ID(), err)
+		}
+		sb.AddIP(ip)
 	}
 }
 
@@ -372,152 +140,9 @@ func (s *Server) restore() {
 // having been modified by other parties
 func (s *Server) Update() {
 	logrus.Debugf("updating sandbox and container information")
-	if err := s.update(); err != nil {
+	if err := s.ContainerServer.Update(); err != nil {
 		logrus.Errorf("error updating sandbox and container information: %v", err)
 	}
-}
-
-func (s *Server) update() error {
-	s.updateLock.Lock()
-	defer s.updateLock.Unlock()
-
-	containers, err := s.store.Containers()
-	if err != nil && !os.IsNotExist(err) {
-		logrus.Warnf("could not read containers and sandboxes: %v", err)
-		return err
-	}
-	newPods := map[string]*storage.RuntimeContainerMetadata{}
-	oldPods := map[string]string{}
-	removedPods := map[string]string{}
-	newPodContainers := map[string]*storage.RuntimeContainerMetadata{}
-	oldPodContainers := map[string]string{}
-	removedPodContainers := map[string]string{}
-	for _, container := range containers {
-		if s.hasSandbox(container.ID) {
-			// FIXME: do we need to reload/update any info about the sandbox?
-			oldPods[container.ID] = container.ID
-			oldPodContainers[container.ID] = container.ID
-			continue
-		}
-		if s.getContainer(container.ID) != nil {
-			// FIXME: do we need to reload/update any info about the container?
-			oldPodContainers[container.ID] = container.ID
-			continue
-		}
-		// not previously known, so figure out what it is
-		metadata, err2 := s.storageRuntimeServer.GetContainerMetadata(container.ID)
-		if err2 != nil {
-			logrus.Errorf("error parsing metadata for %s: %v, ignoring", container.ID, err2)
-			continue
-		}
-		if metadata.Pod {
-			newPods[container.ID] = &metadata
-		} else {
-			newPodContainers[container.ID] = &metadata
-		}
-	}
-	s.ctrIDIndex.Iterate(func(id string) {
-		if _, ok := oldPodContainers[id]; !ok {
-			// this container's ID wasn't in the updated list -> removed
-			removedPodContainers[id] = id
-		}
-	})
-	for removedPodContainer := range removedPodContainers {
-		// forget this container
-		c := s.getContainer(removedPodContainer)
-		if c == nil {
-			logrus.Warnf("bad state when getting container removed %+v", removedPodContainer)
-			continue
-		}
-		s.releaseContainerName(c.Name())
-		s.removeContainer(c)
-		if err = s.ctrIDIndex.Delete(c.ID()); err != nil {
-			return err
-		}
-		logrus.Debugf("forgetting removed pod container %s", c.ID())
-	}
-	s.podIDIndex.Iterate(func(id string) {
-		if _, ok := oldPods[id]; !ok {
-			// this pod's ID wasn't in the updated list -> removed
-			removedPods[id] = id
-		}
-	})
-	for removedPod := range removedPods {
-		// forget this pod
-		sb := s.getSandbox(removedPod)
-		if sb == nil {
-			logrus.Warnf("bad state when getting pod to remove %+v", removedPod)
-			continue
-		}
-		podInfraContainer := sb.infraContainer
-		s.releaseContainerName(podInfraContainer.Name())
-		s.removeContainer(podInfraContainer)
-		if err = s.ctrIDIndex.Delete(podInfraContainer.ID()); err != nil {
-			return err
-		}
-		sb.infraContainer = nil
-		s.releasePodName(sb.name)
-		s.removeSandbox(sb.id)
-		if err = s.podIDIndex.Delete(sb.id); err != nil {
-			return err
-		}
-		logrus.Debugf("forgetting removed pod %s", sb.id)
-	}
-	for sandboxID := range newPods {
-		// load this pod
-		if err = s.loadSandbox(sandboxID); err != nil {
-			logrus.Warnf("could not load new pod sandbox %s: %v, ignoring", sandboxID, err)
-		} else {
-			logrus.Debugf("loaded new pod sandbox %s", sandboxID, err)
-		}
-	}
-	for containerID := range newPodContainers {
-		// load this container
-		if err = s.loadContainer(containerID); err != nil {
-			logrus.Warnf("could not load new sandbox container %s: %v, ignoring", containerID, err)
-		} else {
-			logrus.Debugf("loaded new pod container %s", containerID, err)
-		}
-	}
-	return nil
-}
-
-func (s *Server) reservePodName(id, name string) (string, error) {
-	if err := s.podNameIndex.Reserve(name, id); err != nil {
-		if err == registrar.ErrNameReserved {
-			id, err := s.podNameIndex.Get(name)
-			if err != nil {
-				logrus.Warnf("conflict, pod name %q already reserved", name)
-				return "", err
-			}
-			return "", fmt.Errorf("conflict, name %q already reserved for pod %q", name, id)
-		}
-		return "", fmt.Errorf("error reserving pod name %q", name)
-	}
-	return name, nil
-}
-
-func (s *Server) releasePodName(name string) {
-	s.podNameIndex.Release(name)
-}
-
-func (s *Server) reserveContainerName(id, name string) (string, error) {
-	if err := s.ctrNameIndex.Reserve(name, id); err != nil {
-		if err == registrar.ErrNameReserved {
-			id, err := s.ctrNameIndex.Get(name)
-			if err != nil {
-				logrus.Warnf("conflict, ctr name %q already reserved", name)
-				return "", err
-			}
-			return "", fmt.Errorf("conflict, name %q already reserved for ctr %q", name, id)
-		}
-		return "", fmt.Errorf("error reserving ctr name %s", name)
-	}
-	return name, nil
-}
-
-func (s *Server) releaseContainerName(name string) {
-	s.ctrNameIndex.Release(name)
 }
 
 // cleanupSandboxesOnShutdown Remove all running Sandboxes on system shutdown
@@ -536,70 +161,67 @@ func (s *Server) cleanupSandboxesOnShutdown() {
 
 // Shutdown attempts to shut down the server's storage cleanly
 func (s *Server) Shutdown() error {
-	// why do this on clean shutdown! we want containers left running when ocid
+	// why do this on clean shutdown! we want containers left running when crio
 	// is down for whatever reason no?!
 	// notice this won't trigger just on system halt but also on normal
-	// ocid.service restart!!!
+	// crio.service restart!!!
 	s.cleanupSandboxesOnShutdown()
-	_, err := s.store.Shutdown(false)
-	return err
+	return s.ContainerServer.Shutdown()
+}
+
+// configureMaxThreads sets the Go runtime max threads threshold
+// which is 90% of the kernel setting from /proc/sys/kernel/threads-max
+func configureMaxThreads() error {
+	mt, err := ioutil.ReadFile("/proc/sys/kernel/threads-max")
+	if err != nil {
+		return err
+	}
+	mtint, err := strconv.Atoi(strings.TrimSpace(string(mt)))
+	if err != nil {
+		return err
+	}
+	maxThreads := (mtint / 100) * 90
+	debug.SetMaxThreads(maxThreads)
+	logrus.Debugf("Golang's threads limit set to %d", maxThreads)
+	return nil
 }
 
 // New creates a new Server with options provided
 func New(config *Config) (*Server, error) {
-	store, err := sstorage.GetStore(sstorage.StoreOptions{
-		RunRoot:            config.RunRoot,
-		GraphRoot:          config.Root,
-		GraphDriverName:    config.Storage,
-		GraphDriverOptions: config.StorageOptions,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	imageService, err := storage.GetImageService(store, config.DefaultTransport, config.InsecureRegistries)
-	if err != nil {
-		return nil, err
-	}
-
-	storageRuntimeService := storage.GetRuntimeService(imageService, config.PauseImage)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := os.MkdirAll("/var/run/crio", 0755); err != nil {
 		return nil, err
 	}
 
-	r, err := oci.New(config.Runtime, config.RuntimeUntrustedWorkload, config.DefaultWorkloadTrust, config.Conmon, config.ConmonEnv, config.CgroupManager)
+	config.ContainerExitsDir = oci.ContainerExitsDir
+
+	// This is used to monitor container exits using inotify
+	if err := os.MkdirAll(config.ContainerExitsDir, 0755); err != nil {
+		return nil, err
+	}
+	containerServer, err := lib.New(&config.Config)
 	if err != nil {
 		return nil, err
 	}
-	sandboxes := make(map[string]*sandbox)
-	containers := oci.NewMemoryStore()
+
 	netPlugin, err := ocicni.InitCNI(config.NetworkDir, config.PluginDir)
 	if err != nil {
 		return nil, err
 	}
 	iptInterface := utiliptables.New(utilexec.New(), utildbus.New(), utiliptables.ProtocolIpv4)
 	iptInterface.EnsureChain(utiliptables.TableNAT, iptablesproxy.KubeMarkMasqChain)
-	hostportManager := hostport.NewHostportManager()
+	hostportManager := hostport.NewHostportManager(iptInterface)
+
 	s := &Server{
-		runtime:              r,
-		store:                store,
-		storageImageServer:   imageService,
-		storageRuntimeServer: storageRuntimeService,
-		netPlugin:            netPlugin,
-		hostportManager:      hostportManager,
-		config:               *config,
-		state: &serverState{
-			sandboxes:  sandboxes,
-			containers: containers,
-		},
+		ContainerServer: containerServer,
+		netPlugin:       netPlugin,
+		hostportManager: hostportManager,
+		config:          *config,
 		seccompEnabled:  seccomp.IsEnabled(),
 		appArmorEnabled: apparmor.IsEnabled(),
 		appArmorProfile: config.ApparmorProfile,
+		monitorsChan:    make(chan struct{}),
 	}
+
 	if s.seccompEnabled {
 		seccompProfile, fileErr := ioutil.ReadFile(config.SeccompProfile)
 		if fileErr != nil {
@@ -618,12 +240,8 @@ func New(config *Config) (*Server, error) {
 		}
 	}
 
-	s.podIDIndex = truncindex.NewTruncIndex([]string{})
-	s.podNameIndex = registrar.NewRegistrar()
-	s.ctrIDIndex = truncindex.NewTruncIndex([]string{})
-	s.ctrNameIndex = registrar.NewRegistrar()
-	s.imageContext = &types.SystemContext{
-		SignaturePolicyPath: config.ImageConfig.SignaturePolicyPath,
+	if err := configureMaxThreads(); err != nil {
+		return nil, err
 	}
 
 	s.restore()
@@ -636,6 +254,7 @@ func New(config *Config) (*Server, error) {
 			return nil, err
 		}
 	}
+	s.bindAddress = bindAddress.String()
 
 	_, err = net.LookupPort("tcp", config.StreamPort)
 	if err != nil {
@@ -651,67 +270,58 @@ func New(config *Config) (*Server, error) {
 		return nil, fmt.Errorf("unable to create streaming server")
 	}
 
-	// TODO: Is it should be started somewhere else?
+	s.stream.streamServerCloseCh = make(chan struct{})
 	go func() {
-		s.stream.streamServer.Start(true)
+		defer close(s.stream.streamServerCloseCh)
+		if err := s.stream.streamServer.Start(true); err != nil {
+			logrus.Errorf("Failed to start streaming server: %v", err)
+		}
 	}()
 
-	logrus.Debugf("sandboxes: %v", s.state.sandboxes)
-	logrus.Debugf("containers: %v", s.state.containers)
+	logrus.Debugf("sandboxes: %v", s.ContainerServer.ListSandboxes())
 	return s, nil
 }
 
-type serverState struct {
-	sandboxes  map[string]*sandbox
-	containers oci.ContainerStorer
+func (s *Server) addSandbox(sb *sandbox.Sandbox) {
+	s.ContainerServer.AddSandbox(sb)
 }
 
-func (s *Server) addSandbox(sb *sandbox) {
-	s.stateLock.Lock()
-	s.state.sandboxes[sb.id] = sb
-	s.stateLock.Unlock()
-}
-
-func (s *Server) getSandbox(id string) *sandbox {
-	s.stateLock.Lock()
-	sb := s.state.sandboxes[id]
-	s.stateLock.Unlock()
-	return sb
+func (s *Server) getSandbox(id string) *sandbox.Sandbox {
+	return s.ContainerServer.GetSandbox(id)
 }
 
 func (s *Server) hasSandbox(id string) bool {
-	s.stateLock.Lock()
-	_, ok := s.state.sandboxes[id]
-	s.stateLock.Unlock()
-	return ok
+	return s.ContainerServer.HasSandbox(id)
 }
 
 func (s *Server) removeSandbox(id string) {
-	s.stateLock.Lock()
-	delete(s.state.sandboxes, id)
-	s.stateLock.Unlock()
+	s.ContainerServer.RemoveSandbox(id)
 }
 
 func (s *Server) addContainer(c *oci.Container) {
-	s.stateLock.Lock()
-	sandbox := s.state.sandboxes[c.Sandbox()]
-	// TODO(runcom): handle !ok above!!! otherwise it panics!
-	sandbox.addContainer(c)
-	s.state.containers.Add(c.ID(), c)
-	s.stateLock.Unlock()
+	s.ContainerServer.AddContainer(c)
+}
+
+func (s *Server) addInfraContainer(c *oci.Container) {
+	s.ContainerServer.AddInfraContainer(c)
 }
 
 func (s *Server) getContainer(id string) *oci.Container {
-	s.stateLock.Lock()
-	c := s.state.containers.Get(id)
-	s.stateLock.Unlock()
-	return c
+	return s.ContainerServer.GetContainer(id)
+}
+
+func (s *Server) getInfraContainer(id string) *oci.Container {
+	return s.ContainerServer.GetInfraContainer(id)
+}
+
+// BindAddress is used to retrieve host's IP
+func (s *Server) BindAddress() string {
+	return s.bindAddress
 }
 
 // GetSandboxContainer returns the infra container for a given sandbox
 func (s *Server) GetSandboxContainer(id string) *oci.Container {
-	sb := s.getSandbox(id)
-	return sb.infraContainer
+	return s.ContainerServer.GetSandboxContainer(id)
 }
 
 // GetContainer returns a container by its ID
@@ -720,9 +330,142 @@ func (s *Server) GetContainer(id string) *oci.Container {
 }
 
 func (s *Server) removeContainer(c *oci.Container) {
-	s.stateLock.Lock()
-	sandbox := s.state.sandboxes[c.Sandbox()]
-	sandbox.removeContainer(c)
-	s.state.containers.Delete(c.ID())
-	s.stateLock.Unlock()
+	s.ContainerServer.RemoveContainer(c)
+}
+
+func (s *Server) removeInfraContainer(c *oci.Container) {
+	s.ContainerServer.RemoveInfraContainer(c)
+}
+
+func (s *Server) getPodSandboxFromRequest(podSandboxID string) (*sandbox.Sandbox, error) {
+	if podSandboxID == "" {
+		return nil, sandbox.ErrIDEmpty
+	}
+
+	sandboxID, err := s.PodIDIndex().Get(podSandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("PodSandbox with ID starting with %s not found: %v", podSandboxID, err)
+	}
+
+	sb := s.getSandbox(sandboxID)
+	if sb == nil {
+		return nil, fmt.Errorf("specified pod sandbox not found: %s", sandboxID)
+	}
+	return sb, nil
+}
+
+// CreateMetricsEndpoint creates a /metrics endpoint
+// for prometheus monitoring
+func (s *Server) CreateMetricsEndpoint() (*http.ServeMux, error) {
+	metrics.Register()
+	mux := &http.ServeMux{}
+	mux.Handle("/metrics", prometheus.Handler())
+	return mux, nil
+}
+
+// StopMonitors stops al the monitors
+func (s *Server) StopMonitors() {
+	close(s.monitorsChan)
+}
+
+// MonitorsCloseChan returns the close chan for the exit monitor
+func (s *Server) MonitorsCloseChan() chan struct{} {
+	return s.monitorsChan
+}
+
+// StartHooksMonitor starts a goroutine to dynamically add hooks at runtime
+func (s *Server) StartHooksMonitor() {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logrus.Fatalf("Failed to create new watch: %v", err)
+	}
+	defer watcher.Close()
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case event := <-watcher.Events:
+				logrus.Debugf("event: %v", event)
+				if event.Op&fsnotify.Remove == fsnotify.Remove {
+					logrus.Debugf("removing hook %s", event.Name)
+					s.ContainerServer.RemoveHook(filepath.Base(event.Name))
+				}
+				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
+					logrus.Debugf("adding hook %s", event.Name)
+					s.ContainerServer.AddHook(event.Name)
+				}
+			case err := <-watcher.Errors:
+				logrus.Debugf("watch error: %v", err)
+				return
+			case <-s.monitorsChan:
+				logrus.Debug("closing hooks monitor...")
+				close(done)
+				return
+			}
+		}
+	}()
+	if err := watcher.Add(s.config.HooksDirPath); err != nil {
+		logrus.Errorf("watcher.Add(%q) failed: %s", s.config.HooksDirPath, err)
+		close(done)
+	}
+	<-done
+}
+
+// StartExitMonitor start a routine that monitors container exits
+// and updates the container status
+func (s *Server) StartExitMonitor() {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		logrus.Fatalf("Failed to create new watch: %v", err)
+	}
+	defer watcher.Close()
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case event := <-watcher.Events:
+				logrus.Debugf("event: %v", event)
+				if event.Op&fsnotify.Create == fsnotify.Create {
+					containerID := filepath.Base(event.Name)
+					logrus.Debugf("container or sandbox exited: %v", containerID)
+					c := s.GetContainer(containerID)
+					if c != nil {
+						logrus.Debugf("container exited and found: %v", containerID)
+						err := s.Runtime().UpdateStatus(c)
+						if err != nil {
+							logrus.Warnf("Failed to update container status %s: %v", c, err)
+						} else {
+							s.ContainerStateToDisk(c)
+						}
+					} else {
+						sb := s.GetSandbox(containerID)
+						if sb != nil {
+							c := sb.InfraContainer()
+							logrus.Debugf("sandbox exited and found: %v", containerID)
+							err := s.Runtime().UpdateStatus(c)
+							if err != nil {
+								logrus.Warnf("Failed to update sandbox infra container status %s: %v", c, err)
+							} else {
+								s.ContainerStateToDisk(c)
+							}
+						}
+					}
+				}
+			case err := <-watcher.Errors:
+				logrus.Debugf("watch error: %v", err)
+				return
+			case <-s.monitorsChan:
+				logrus.Debug("closing exit monitor...")
+				close(done)
+				return
+			}
+		}
+	}()
+	if err := watcher.Add(s.config.ContainerExitsDir); err != nil {
+		logrus.Errorf("watcher.Add(%q) failed: %s", s.config.ContainerExitsDir, err)
+		close(done)
+	}
+	<-done
 }

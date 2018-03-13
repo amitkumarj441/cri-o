@@ -2,7 +2,6 @@ package seccomp
 
 import (
 	"runtime"
-	"syscall"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
@@ -370,26 +369,25 @@ func DefaultProfile(rs *specs.Spec) *rspec.LinuxSeccomp {
 	var sysCloneFlagsIndex uint
 
 	capSysAdmin := false
-	var cap string
-	var caps []string
+	caps := make(map[string]bool)
 
-	for _, cap = range rs.Process.Capabilities.Bounding {
-		caps = append(caps, cap)
+	for _, cap := range rs.Process.Capabilities.Bounding {
+		caps[cap] = true
 	}
-	for _, cap = range rs.Process.Capabilities.Effective {
-		caps = append(caps, cap)
+	for _, cap := range rs.Process.Capabilities.Effective {
+		caps[cap] = true
 	}
-	for _, cap = range rs.Process.Capabilities.Inheritable {
-		caps = append(caps, cap)
+	for _, cap := range rs.Process.Capabilities.Inheritable {
+		caps[cap] = true
 	}
-	for _, cap = range rs.Process.Capabilities.Permitted {
-		caps = append(caps, cap)
+	for _, cap := range rs.Process.Capabilities.Permitted {
+		caps[cap] = true
 	}
-	for _, cap = range rs.Process.Capabilities.Ambient {
-		caps = append(caps, cap)
+	for _, cap := range rs.Process.Capabilities.Ambient {
+		caps[cap] = true
 	}
 
-	for _, cap = range caps {
+	for cap := range caps {
 		switch cap {
 		case "CAP_DAC_READ_SEARCH":
 			syscalls = append(syscalls, []rspec.LinuxSyscall{
@@ -514,7 +512,7 @@ func DefaultProfile(rs *specs.Spec) *rspec.LinuxSeccomp {
 				Args: []rspec.LinuxSeccompArg{
 					{
 						Index:    sysCloneFlagsIndex,
-						Value:    syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUSER | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET,
+						Value:    CloneNewNS | CloneNewUTS | CloneNewIPC | CloneNewUser | CloneNewPID | CloneNewNet,
 						ValueTwo: 0,
 						Op:       rspec.OpMaskedEqual,
 					},

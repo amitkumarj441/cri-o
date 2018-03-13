@@ -5,9 +5,8 @@ override LIBS +=
 override CFLAGS += -std=c99 -Os -Wall -Wextra -static
 
 pause: $(obj)
-	$(CC) -o $@ $^ $(CFLAGS) $(LIBS)
-	strip $@
+	$(CC) -o ../bin/$@ $^ $(CFLAGS) $(LIBS)
 
 .PHONY: clean
 clean:
-	rm -f $(obj) pause
+	rm -f $(obj) ../bin/pause
